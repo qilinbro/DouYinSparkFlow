@@ -3,12 +3,70 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from core.douyin_im import DouyinIM, ImMonitor, scrape_ssr
+from core.douyin_im import DouyinIM, ImMonitor, check_login, scrape_ssr
 
 
 class FakePage:
     def on(self, *args):
         pass
+
+
+class LoginEvidenceTests(unittest.TestCase):
+    def page(self, html, dom=None, stored_session_name=False):
+        # Only synthetic metadata: no cookie values or browser/account session.
+        cookies = MagicMock(return_value=[{"name": "sessionid"}] if stored_session_name else [])
+        page = SimpleNamespace(
+            content=lambda: html,
+            evaluate=lambda expression: dom or {},
+            context=SimpleNamespace(cookies=cookies),
+        )
+        mon = SimpleNamespace(login={"verdict": "unknown", "user_id": None})
+        return page, mon, cookies
+
+    def test_shell_and_challenge_html_without_auth_markers_are_unknown(self):
+        for html in (b"<html><div id='root'></div></html>",
+                     b"<html><title>Verify your browser</title></html>",
+                     b'{"page":"loading"}'):
+            with self.subTest(html=html):
+                self.assertEqual(scrape_ssr(html)["verdict"], "unknown")
+
+    def test_chat_root_can_supply_dom_fallback_when_ssr_has_no_auth_evidence(self):
+        page, mon, cookies = self.page(
+            "<html><div id='root'></div></html>",
+            {"loginVisible": False, "avatarCard": False, "hasChatRoot": True},
+        )
+        result = check_login(page, mon)
+        self.assertEqual(result["state"], "LOGGED_IN")
+        self.assertIsNone(result["user_id"])
+        cookies.assert_not_called()
+
+    def test_session_name_does_not_turn_unknown_authentication_into_expired(self):
+        page, mon, cookies = self.page(
+            "<html><title>Verify your browser</title></html>",
+            {"loginVisible": False, "avatarCard": False, "hasChatRoot": False},
+            stored_session_name=True,
+        )
+        self.assertEqual(check_login(page, mon)["state"], "UNKNOWN")
+        cookies.assert_not_called()
+
+    def test_explicit_logged_out_stays_blocked_even_with_chat_root(self):
+        page, mon, cookies = self.page(
+            '{"user":{"isLogin":false}}',
+            {"loginVisible": False, "avatarCard": False, "hasChatRoot": True},
+            stored_session_name=True,
+        )
+        self.assertEqual(check_login(page, mon)["state"], "EXPIRED")
+        cookies.assert_called_once()
+
+    def test_explicit_authenticated_user_is_preserved_without_dom_fallback(self):
+        page, mon, cookies = self.page(
+            '{"user":{"isLogin":true,"info":{"uid":"10000000001"}}}',
+            {"loginVisible": True},
+        )
+        result = check_login(page, mon)
+        self.assertEqual(result["state"], "LOGGED_IN")
+        self.assertEqual(result["user_id"], "10000000001")
+        cookies.assert_not_called()
 
 
 class ReceiptTests(unittest.TestCase):

@@ -61,7 +61,7 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
             # 终端态都要显式打印，方便从日志分辨是哪种失败
             reason = {
                 "LOGGED_OUT": "未登录（没有 sessionid）",
-                "EXPIRED": "登录已失效（有 sessionid 但服务端不认）",
+                "EXPIRED": "当前环境未识别登录（页面显示未登录）",
                 "LOGIN_LOST": "运行期掉登录",
                 "TIMEOUT": "等待超时",
                 "ERROR": "内部错误",

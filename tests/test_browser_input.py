@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import quote
 
-from core.douyin_im import DouyinIM, JS_LIST_READY
+from core.douyin_im import DouyinIM, JS_LIST_READY, check_login
 
 
 @unittest.skipUnless(os.getenv("RUN_BROWSER_INPUT_TESTS") == "1" or os.getenv("TEST_BROWSER_CHANNEL"),
@@ -49,6 +49,18 @@ class BrowserInputTests(unittest.TestCase):
 
     def test_real_mouse_movement_selects_real_input(self):
         self.assertEqual(self.im._input_mode(), "real")
+
+    def test_hidden_login_modal_does_not_reject_a_visible_chat(self):
+        self.page.evaluate('''() => {
+          const modal = document.createElement('div');
+          modal.dataset.e2e = 'login-container';
+          modal.style.display = 'none'; modal.textContent = 'Login';
+          document.body.append(modal);
+        }''')
+        monitor = SimpleNamespace(login={"verdict": "unknown", "raw": {}})
+        self.assertEqual(check_login(self.page, monitor)["state"], "LOGGED_IN")
+        self.page.evaluate("document.querySelector('[data-e2e=login-container]').style.display='block'")
+        self.assertEqual(check_login(self.page, monitor)["state"], "NOT_LOGGED_IN")
 
     def test_optional_avatar_and_blank_placeholder_do_not_block_ready_list(self):
         self.page.evaluate('''() => {

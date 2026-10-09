@@ -94,13 +94,20 @@ EDITOR_CANDIDATES = (
 # 二、页面内执行表达式（page.evaluate 直接跑，返回结构化结果）
 # ===========================================================================
 
-JS_LOGIN_DOM = """(() => ({
-  loginVisible: !!document.querySelector('[data-e2e="login-container"]'),
-  avatarCard: !!document.querySelector('[data-e2e="user-avatar-card"]'),
-  hasChatRoot: !!document.querySelector('[data-e2e="msg-input"]')
-            || !!document.querySelector('.conversationConversationListwrapper'),
-  itemCount: document.querySelectorAll('[data-e2e="conversation-item"]').length,
-}))()"""
+JS_LOGIN_DOM = """(() => {
+  const visible = selector => [...document.querySelectorAll(selector)].some(el => {
+    const style = getComputedStyle(el);
+    return !!el.getClientRects().length && style.display !== 'none'
+      && style.visibility !== 'hidden' && style.visibility !== 'collapse'
+      && (!el.checkVisibility || el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}));
+  });
+  return {
+    loginVisible: visible('[data-e2e="login-container"]'),
+    avatarCard: visible('[data-e2e="user-avatar-card"]'),
+    hasChatRoot: visible('[data-e2e="msg-input"], .conversationConversationListwrapper'),
+    itemCount: document.querySelectorAll('[data-e2e="conversation-item"]').length,
+  };
+})()"""
 
 # 列表"可以开始滚了"（≠ 列表已全量加载）。存在非空标题、容器有高度即可。
 JS_LIST_READY = """(() => {
@@ -656,8 +663,6 @@ def scrape_ssr(html):
         out["verdict"] = "logged_out"
     elif raw.get("is_login") == "true" and out["user_id"] and out["user_id"] != "0":
         out["verdict"] = "logged_in"
-    elif not out["user_id"] and raw.get("is_login") is None:
-        out["verdict"] = "logged_out"
     return out
 
 
@@ -978,7 +983,7 @@ def attach(page):
 LOGIN_LOGS = {
     "LOGGED_IN": "[LOGIN] ✅ 已登录",
     "NOT_LOGGED_IN": "[LOGIN] ❌ 未登录（没有 sessionid）→ 需要扫码登录",
-    "EXPIRED": "[LOGIN] ⚠️ 登录已失效（有 sessionid 但服务端不认）→ 需要重新登录",
+    "EXPIRED": "[LOGIN] ⚠️ 当前环境未识别登录（有 sessionid，页面显示未登录）→ 请检查网页会话",
     "UNKNOWN": "[LOGIN] ❓ 登录态未知（SSR 与 DOM 都没给出结论）",
 }
 
@@ -992,6 +997,18 @@ def check_login(page, mon):
 
     # ① 监听拿到的 SSR（最准）
     li = mon.login if mon else {}
+    evidence = {
+        "monitor_verdict": li.get("verdict", "unknown"),
+        "monitor_is_login": li.get("raw", {}).get("is_login"),
+        "monitor_missing_login_cookie": li.get("raw", {}).get("not_exist_login_cookie"),
+        "page_verdict": None,
+        "page_is_login": None,
+        "page_missing_login_cookie": None,
+        "login_visible": None,
+        "avatar_visible": None,
+        "chat_root_visible": None,
+        "session_cookie_present": None,
+    }
     if li.get("verdict") == "logged_in" and li.get("user_id"):
         state, user_id, nickname, sec_uid = ("LOGGED_IN", li["user_id"],
                                              li.get("nickname"), li.get("sec_uid"))
@@ -1003,6 +1020,8 @@ def check_login(page, mon):
         except Exception:
             html = ""
         s = scrape_ssr(html)
+        evidence.update(page_verdict=s["verdict"], page_is_login=s["raw"].get("is_login"),
+                        page_missing_login_cookie=s["raw"].get("not_exist_login_cookie"))
         if s["verdict"] == "logged_in" and s["user_id"]:
             state, user_id, nickname, sec_uid = ("LOGGED_IN", s["user_id"],
                                                  s["nickname"], s["sec_uid"])
@@ -1015,19 +1034,23 @@ def check_login(page, mon):
             dom = page.evaluate(JS_LOGIN_DOM)
         except Exception:
             dom = {}
+        evidence.update(login_visible=bool(dom.get("loginVisible")),
+                        avatar_visible=bool(dom.get("avatarCard")),
+                        chat_root_visible=bool(dom.get("hasChatRoot")))
         if dom.get("loginVisible"):
             state = "NOT_LOGGED_IN"
         elif dom.get("avatarCard") or dom.get("hasChatRoot"):
             state = "LOGGED_IN"      # 有聊天根节点，但没拿到 uid
             nickname = nickname or None
 
-    # ④ cookie 佐证：有 sessionid 但判未登录 → 判为"已失效"而不是"未登录"
+    # ④ 保留 EXPIRED 枚举兼容调用方；仅表示当前页面未识别已有会话，不证明全局过期。
     if state == "NOT_LOGGED_IN":
         try:
             names = [c.get("name", "") for c in page.context.cookies()]
         except Exception:
             names = []
-        if any(n.startswith("sessionid") for n in names):
+        evidence["session_cookie_present"] = any(n.startswith("sessionid") for n in names)
+        if evidence["session_cookie_present"]:
             state = "EXPIRED"
 
     line = LOGIN_LOGS.get(state, LOGIN_LOGS["UNKNOWN"])
@@ -1037,7 +1060,7 @@ def check_login(page, mon):
         line += f"  nickname={nickname}"
 
     return {"state": state, "user_id": user_id, "nickname": nickname,
-            "sec_uid": sec_uid, "log": line}
+            "sec_uid": sec_uid, "log": line, "evidence": evidence}
 
 
 # ---------------------------------------------------------------------------
@@ -1227,13 +1250,17 @@ class DouyinIM:
             "login_state": lg.get("state"),
             "list": ls or {"ready": False, "count": 0},
             "log": lg.get("log"),
+            "login_evidence": lg.get("evidence", {}),
         }
         tag = {"READY": "✅ 就绪", "LOGGED_OUT": "⛔ 未登录",
-               "EXPIRED": "⚠️ 登录已失效", "LOGIN_LOST": "⛔ 掉登录",
+               "EXPIRED": "⚠️ 当前环境未识别登录", "LOGIN_LOST": "⛔ 掉登录",
                "TIMEOUT": "⚠️ 超时", "ERROR": "❌ 出错"}.get(status, status)
         (logger.info if status == STATUS_READY else logger.error)(
             f"[IM] {tag}  user_id={self._state['user_id'] or '-'}"
             + (f"  nickname={self._state['nickname']}" if self._state["nickname"] else ""))
+        if status != STATUS_READY:
+            logger.warning("[LOGIN] 状态证据 " + json.dumps(self._state["login_evidence"],
+                           ensure_ascii=True, separators=(",", ":")))
         for cb in list(self._callbacks):
             try:
                 cb(dict(self._state))
