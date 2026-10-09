@@ -180,6 +180,39 @@ class TaskResultTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["select_failed"], ["fake unselected"])
 
+    def test_verified_external_page_is_reused_without_cookie_overwrite(self):
+        im = FakeIM([ACCEPTED])
+        im.wait_ready = lambda: {"status": "READY", "user_id": "12345"}
+        self.tasks.DouyinIM = MagicMock(return_value=im)
+        browser, context, page = MagicMock(), MagicMock(), MagicMock()
+        def before_send(ready_context):
+            self.assertIs(ready_context, context)
+            self.assertEqual(im.calls, [])
+        result = self.tasks.do_user_task(browser, 'fake', [{'name': 'stale'}], ['fake'], max_sends=1,
+                                        context=context, page=page, expected_uid='12345',
+                                        on_authenticated=before_send)
+        self.assertTrue(result['ok'])
+        browser.new_context.assert_not_called()
+        context.add_cookies.assert_not_called()
+        context.new_page.assert_not_called()
+        context.close.assert_not_called()
+        page.close.assert_not_called()
+        self.tasks.DouyinIM.assert_called_once()
+        self.assertIs(self.tasks.DouyinIM.call_args.args[0], page)
+
+    def test_unexpected_account_blocks_capture_and_selection(self):
+        im = FakeIM([ACCEPTED])
+        im.wait_ready = lambda: {"status": "READY", "user_id": "54321"}
+        im.iter_find_and_select = MagicMock()
+        self.tasks.DouyinIM = MagicMock(return_value=im)
+        callback = MagicMock()
+        result = self.tasks.do_user_task(MagicMock(), 'fake', [], ['fake'],
+                                        expected_uid='12345', on_authenticated=callback)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['attempted'], 0)
+        callback.assert_not_called()
+        im.iter_find_and_select.assert_not_called()
+
 
 class RunTaskExitTests(unittest.TestCase):
     def setUp(self):

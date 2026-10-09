@@ -13,11 +13,17 @@ on:
         type: boolean
         default: false
         required: false
+      qr_login:
+        description: "在 GitHub 云端扫码登录，并只向指定好友试发一条"
+        type: boolean
+        default: false
+        required: false
   schedule:
     - cron: "0 1 * * *" # 每天北京时间 09:00；GitHub 可能延迟启动
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: douyin-spark-flow-${{ github.ref }}
@@ -33,6 +39,10 @@ jobs:
       # 仅传入应用所需配置，不批量导出 Secrets，也不生成包含 Cookie 的 .env。
       TASKS: ${{ vars.TASKS }}
       COOKIES_35503009597: ${{ secrets.COOKIES_35503009597 }}
+      CLOUD_AUTH_KEY: ${{ secrets.CLOUD_AUTH_KEY }}
+      CLOUD_EXPECTED_UID: ${{ vars.CLOUD_EXPECTED_UID }}
+      CLOUD_AUTH_DIR: ${{ (inputs.qr_login || vars.CLOUD_AUTH_ENABLED == 'true') && format('{0}/cloud-auth', runner.temp) || '' }}
+      CLOUD_LOGIN_DIR: ${{ runner.temp }}/cloud-login
       PROXY_ADDRESS: ${{ vars.PROXY_ADDRESS }}
       MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE || '续火花' }}
       HITOKOTO_TYPES: ${{ vars.HITOKOTO_TYPES || '["文学","影视","诗词","哲学"]' }}
@@ -74,7 +84,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Run regression tests
-        run: python -m unittest tests.test_douyin_im tests.test_logger tests.test_matching_guard tests.test_delivery_guards tests.test_task_results tests.test_receipt_diagnostics
+        run: python -m unittest tests.test_douyin_im tests.test_logger tests.test_matching_guard tests.test_delivery_guards tests.test_task_results tests.test_receipt_diagnostics tests.test_cloud_auth tests.test_cloud_login tests.test_restore_cloud_auth
 
       - name: Install Chromium system dependencies
         run: python -m playwright install-deps chromium
@@ -151,9 +161,47 @@ jobs:
           RUN_BROWSER_INPUT_TESTS: "1"
         run: python -m unittest tests.test_browser_input
 
+      - name: Restore encrypted cloud login
+        if: (github.event_name == 'schedule' || !inputs.validate_only) && !inputs.qr_login && env.CLOUD_AUTH_DIR != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m utils.restore_cloud_auth
+
+      - name: Set up cloud login transport
+        if: inputs.qr_login && !inputs.validate_only
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Install cloud login artifact client
+        if: inputs.qr_login && !inputs.validate_only
+        run: npm ci --prefix tools/cloud-artifacts --ignore-scripts --no-audit --no-fund
+
+      - name: Log in and test once in GitHub cloud
+        if: inputs.qr_login && !inputs.validate_only
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8, Node 24
+        env:
+          CLOUD_LOGIN_VIEW_KEY: ${{ secrets.CLOUD_LOGIN_VIEW_KEY }}
+          CLOUD_LOGIN_TARGET: "繁华，尽."
+          MESSAGE_TEMPLATE: "续火花测试"
+          TEST_MAX_SENDS: "1"
+        with:
+          script: |
+            const path = require('node:path');
+            await require(path.join(process.env.GITHUB_WORKSPACE, 'tools/cloud_artifacts.cjs')).login(core);
+
       - name: Run DouYin Spark Flow
-        if: github.event_name == 'schedule' || !inputs.validate_only
+        if: (github.event_name == 'schedule' || !inputs.validate_only) && !inputs.qr_login
         run: python main.py task
+
+      - name: Save encrypted cloud login
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || !inputs.validate_only) && env.CLOUD_AUTH_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cloud-auth-state-${{ github.run_id }}
+          path: ${{ env.CLOUD_AUTH_DIR }}/*.bin
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Upload run logs
         if: ${{ !cancelled() }}

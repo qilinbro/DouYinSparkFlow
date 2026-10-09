@@ -1,0 +1,12 @@
+{
+  "name": "douyin-cloud-artifacts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Encrypted live QR transport for GitHub Actions cloud login",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@actions/artifact": "2.3.2"
+  }
+}

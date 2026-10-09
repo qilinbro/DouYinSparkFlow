@@ -22,7 +22,8 @@ def _test_send_limit():
     return value
 
 
-def do_user_task(browser, username, cookies, targets, max_sends=None):
+def do_user_task(browser, username, cookies, targets, max_sends=None, *,
+                 context=None, page=None, expected_uid=None, on_authenticated=None):
     """一个账号的完整流程：门禁 → 滚动找人 → 发送 → 回执确认。
 
     实现委托给 `core.douyin_im.DouyinIM`：
@@ -32,7 +33,9 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
     拟人化节奏由 cloakbrowser 的 humanize 负责，这里不再叠加延迟。
     """
     max_sends = _test_send_limit() if max_sends is None else max_sends
-    context = browser.new_context()  # 每个任务使用独立的上下文
+    owns_context = context is None
+    if owns_context:
+        context = browser.new_context()  # 每个任务使用独立的上下文
     context.set_default_navigation_timeout(
         config["browserActionTimeout"]
     )  # 导航超时（毫秒，config 已换算好）
@@ -40,9 +43,12 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
         config["browserActionTimeout"]
     )  # 单次操作默认超时（毫秒）
 
-    page = context.new_page()
+    owns_page = page is None
+    if owns_page:
+        page = context.new_page()
 
-    context.add_cookies(cookies)
+    if owns_context:
+        context.add_cookies(cookies)
 
     im = None
     try:
@@ -57,7 +63,8 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
         )
 
         res = im.wait_ready()
-        if res.get("status") != STATUS_READY:
+        identity_mismatch = expected_uid is not None and str(res.get("user_id")) != str(expected_uid)
+        if res.get("status") != STATUS_READY or identity_mismatch:
             # 终端态都要显式打印，方便从日志分辨是哪种失败
             reason = {
                 "LOGGED_OUT": "未登录（没有 sessionid）",
@@ -66,6 +73,8 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
                 "TIMEOUT": "等待超时",
                 "ERROR": "内部错误",
             }.get(res.get("status"), res.get("status"))
+            if identity_mismatch and res.get("status") == STATUS_READY:
+                reason = "登录账号与配置不符"
             logger.error(f"账号 {username} 操作前检查未通过：{reason}，跳过该账号")
             return {
                 "ok": False,
@@ -82,6 +91,8 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
             f"账号 {username} 门禁通过  user_id={res.get('user_id')} "
             f"nickname={res.get('nickname')} 会话列表就绪"
         )
+        if on_authenticated is not None:
+            on_authenticated(context)
 
         sent_ok = sent_fail = attempted = 0
         limited = False
@@ -179,7 +190,10 @@ def do_user_task(browser, username, cookies, targets, max_sends=None):
                 im.detach()
             except Exception:
                 pass
-        context.close()
+        if owns_context:
+            context.close()
+        elif owns_page:
+            page.close()
 
 
 def runTasks():
@@ -221,10 +235,26 @@ def runTasks():
         fingerprint = user.get("fingerprint", None)
         logger.info(f"开始处理账号 {username}")
         browser = None
+        cloud_context = None
         try:
+            cloud_bundle = None
+            if os.getenv("CLOUD_AUTH_DIR"):
+                from utils.cloud_auth import load_bundle, create_context, capture_context, save_bundle
+                cloud_bundle = load_bundle(user["unique_id"], expected_uid=os.getenv("CLOUD_EXPECTED_UID") or None)
+                fingerprint = cloud_bundle["fingerprint"]
             browser = get_browser(fingerprint)
             remaining = max_sends - attempted if max_sends else 0
-            result = do_user_task(browser, username, cookies, targets, max_sends=remaining)
+            if cloud_bundle is not None:
+                cloud_context = create_context(browser, cloud_bundle)
+                def save_authenticated(context):
+                    save_bundle(capture_context(context, user["unique_id"],
+                                                cloud_bundle["expected_uid"], fingerprint))
+                    logger.info("云端完整登录状态已加密更新")
+                result = do_user_task(browser, username, [], targets, max_sends=remaining,
+                                      context=cloud_context, expected_uid=cloud_bundle["expected_uid"],
+                                      on_authenticated=save_authenticated)
+            else:
+                result = do_user_task(browser, username, cookies, targets, max_sends=remaining)
             attempted += int(result.get("attempted") or 0)
             results.append((username, result))
             if not result.get("ok"):
@@ -255,6 +285,11 @@ def runTasks():
                 logger.warning("受限测试遇到异常，停止后续账号以避免额外发送")
                 break
         finally:
+            if cloud_context is not None:
+                try:
+                    cloud_context.close()
+                except Exception:
+                    logger.warning("云端上下文关闭失败")
             if browser is not None:
                 try:
                     browser.close()
