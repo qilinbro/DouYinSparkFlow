@@ -2,6 +2,7 @@
 import os
 import unittest
 from types import SimpleNamespace
+from urllib.parse import quote
 
 from core.douyin_im import DouyinIM
 
@@ -29,14 +30,15 @@ class BrowserInputTests(unittest.TestCase):
     def setUp(self):
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
-        self.page.goto("data:text/html,<title>Input regression</title>", wait_until="domcontentloaded")
-        self.page.set_content('''<div data-e2e="msg-input" class="DraftEditor-root">
+        html = '''<meta charset="utf-8"><title>Input regression</title>
+          <div data-e2e="msg-input" class="DraftEditor-root">
           <div class="public-DraftEditor-content" contenteditable="true"></div></div>
           <button class="messageMsgInputpublishBtn" onclick="window.sendClicks=(window.sendClicks||0)+1">Send</button>
           <script>document.querySelector('[contenteditable]').addEventListener('input',()=>{
             document.querySelector('button').classList.toggle('messageMsgInputpublishRedBtn',
-              !!document.querySelector('[contenteditable]').textContent.trim());});</script>''',
-              wait_until="domcontentloaded", timeout=15000)
+              !!document.querySelector('[contenteditable]').textContent.trim());});</script>'''
+        self.page.goto("data:text/html;charset=utf-8," + quote(html),
+                       wait_until="domcontentloaded", timeout=15000)
         self.im = object.__new__(DouyinIM)
         self.im.page = self.page
         self.im.mon = SimpleNamespace(sends=[])
