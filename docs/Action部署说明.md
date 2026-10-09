@@ -4,6 +4,20 @@
 
 本项目已经预设Action配置，只需填写相关配置即可启用。
 
+## 当前仓库的运行配置
+
+`qilinbro/DouYinSparkFlow` 使用主线工作流 `DouYin Spark Flow Schedule Run`，每天北京时间 09:00 定时执行。`api`、`dev` 测试工作流已禁用，因为本仓库没有对应分支。
+
+- 配置读取自 `user-data` Environment 中已有的 Variables 和 `COOKIES_<抖音号>` Secret。不要提交含 Cookie 的 `.env` 文件。
+- 主线工作流显式列出所需配置，不再导出全部 Secrets 或把 Cookie 写入 `.env`。
+- 添加账号时，除了更新 `TASKS`、新增对应 Cookie Secret，还需在 `.github/workflows/schedule.yml` 的 `env` 下添加 `COOKIES_<抖音号>: ${{ secrets.COOKIES_<抖音号> }}`。
+- 手动点击 `Run workflow` 时，默认勾选“只检查配置和浏览器，不向好友发送消息”。检查通过后，取消勾选才能手动执行实际任务；每天的定时任务会正常执行实际任务。
+- 账号、好友列表或 Cookie 格式缺失时会直接报错，避免空任务被显示为成功。配置检查只确认格式，不能确认 Cookie 的登录状态。
+- GitHub 检测到旧工作流可能有风险时，旧运行会显示 `action_required`。应测试修正后的主线版本，不要直接批准旧运行。
+- GitHub 定时任务可能延迟。公开仓库连续 60 天没有活动时，GitHub 可能停用定时任务，需要在 Actions 页面重新启用。
+
+如果 Cookie 曾提交到公开仓库，删除当前文件不能消除历史记录中的内容。请重新登录抖音，使旧会话失效，并更新 `user-data` 中对应的 Cookie Secret。
+
 ## 1. Fork 仓库
 
 采用Action部署本项目需要先 Fork 仓库。

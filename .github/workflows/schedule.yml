@@ -1,44 +1,88 @@
 name: DouYin Spark Flow Schedule Run
+
 on:
-  workflow_dispatch: # 允许手动触发
-  schedule: # 定时任务
-    - cron: "0 1 * * *" # 每天 1:00 UTC（对应北京时间 9:00）
+  workflow_dispatch:
+    inputs:
+      validate_only:
+        description: "只检查配置和浏览器，不向好友发送消息"
+        type: boolean
+        default: true
+        required: true
+  schedule:
+    - cron: "0 1 * * *" # 每天北京时间 09:00；GitHub 可能延迟启动
+
+permissions:
+  contents: read
+
+concurrency:
+  group: douyin-spark-flow-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   run-main:
+    if: github.ref == 'refs/heads/main'
     timeout-minutes: 20
     runs-on: ubuntu-latest
     environment: user-data
+    env:
+      # 仅传入应用所需配置，不批量导出 Secrets，也不生成包含 Cookie 的 .env。
+      TASKS: ${{ vars.TASKS }}
+      COOKIES_35503009597: ${{ secrets.COOKIES_35503009597 }}
+      PROXY_ADDRESS: ${{ vars.PROXY_ADDRESS }}
+      MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE || '续火花' }}
+      HITOKOTO_TYPES: ${{ vars.HITOKOTO_TYPES || '["文学","影视","诗词","哲学"]' }}
+      MATCH_MODE: ${{ vars.MATCH_MODE || 'nickname' }}
+      BROWSER_TIMEOUT: ${{ vars.BROWSER_TIMEOUT || '120000' }}
+      FRIEND_LIST_WAIT_TIME: ${{ vars.FRIEND_LIST_WAIT_TIME || '2000' }}
+      TASK_RETRY_TIMES: ${{ vars.TASK_RETRY_TIMES || '3' }}
+      LOG_LEVEL: ${{ vars.LOG_LEVEL || 'Info' }}
+      PYTHONUNBUFFERED: "1"
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-    - name: Test Douyin Accessibility
-      run: |
-        curl -I https://creator.douyin.com/
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    - name: Ensure browsers are installed
-      run: playwright install chromium --with-deps --only-shell
-    - name: Export Github Environment Variables and Secrets to JSON
-      env:
-        VARS_JSON: ${{ toJson(vars) }}
-        SECRETS_JSON: ${{ toJson(secrets) }}
-      run: python utils/export_github_env.py
-    - name: Run DouYin Spark Flow
-      run: python main.py
-    - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
-      with:
-        name: run-logs
-        path: logs/
-  workflow-keepalive:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - uses: liskin/gh-workflow-keepalive@v1
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Validate account configuration
+        run: python utils/validate_action_config.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Chromium headless shell
+        run: python -m playwright install chromium --with-deps --only-shell
+
+      - name: Check browser startup
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              page = browser.new_page()
+              page.set_content("<title>Browser check</title>")
+              assert page.title() == "Browser check"
+              browser.close()
+          print("Chromium 启动检查通过。")
+          PY
+
+      - name: Run DouYin Spark Flow
+        if: github.event_name == 'schedule' || !inputs.validate_only
+        run: python main.py
+
+      - name: Upload run logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: run-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
