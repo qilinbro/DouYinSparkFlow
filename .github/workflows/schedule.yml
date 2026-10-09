@@ -126,7 +126,11 @@ jobs:
               raise RuntimeError("CloakBrowser 启动失败。")
           try:
               page = browser.new_page()
-              page.set_content("<title>Browser check</title>")
+              page.goto(
+                  "data:text/html,<title>Browser check</title>",
+                  wait_until="domcontentloaded",
+                  timeout=15000,
+              )
               assert page.title() == "Browser check"
           finally:
               browser.close()
