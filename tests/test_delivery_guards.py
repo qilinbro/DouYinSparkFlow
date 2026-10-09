@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from core.douyin_im import DouyinIM, ImMonitor
+from core.douyin_im import DouyinIM, ImMonitor, scrape_ssr
 
 
 class FakePage:
@@ -12,6 +12,24 @@ class FakePage:
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_visitor_id_does_not_override_explicit_logged_out(self):
+        result = scrape_ssr(b'{"odin":"{\\"user_id\\":\\"10000000001\\"}","user":{"isLogin":false}}')
+        self.assertEqual(result["verdict"], "logged_out")
+
+    def test_visitor_id_alone_does_not_prove_login(self):
+        result = scrape_ssr(b'{"odin":"{\\"user_id\\":\\"10000000001\\"}"}')
+        self.assertNotEqual(result["verdict"], "logged_in")
+
+    def test_iframe_document_cannot_override_main_account(self):
+        page = FakePage()
+        page.main_frame = object()
+        mon = ImMonitor(page)
+        response = SimpleNamespace(url="https://www.douyin.com/chat", frame=object(),
+                                   request=SimpleNamespace(resource_type="document"))
+        mon._on_response(response)
+        self.assertEqual(mon.hits, {})
+        self.assertEqual(mon.errors, [])
+
     def wait(self, receipts, optimistic_dom=False, conv_id=None):
         im = object.__new__(DouyinIM)
         im.mon = SimpleNamespace(sends=receipts)

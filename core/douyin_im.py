@@ -101,7 +101,7 @@ JS_LOGIN_DOM = """(() => ({
   itemCount: document.querySelectorAll('[data-e2e="conversation-item"]').length,
 }))()"""
 
-# 列表"可以开始滚了"（≠ 列表已全量加载）。标题非空、头像已加载、容器有高度。
+# 列表"可以开始滚了"（≠ 列表已全量加载）。存在非空标题、容器有高度即可。
 JS_LIST_READY = """(() => {
   const items = document.querySelectorAll('[data-e2e="conversation-item"]');
   if (items.length === 0) return { ready: false, why: 'no-item', count: 0 };
@@ -110,12 +110,10 @@ JS_LIST_READY = """(() => {
     const t = el.querySelector('.conversationConversationItemtitle');
     if (!t || !t.textContent.trim()) blank++;
   });
-  if (blank > 0) return { ready: false, why: 'title-blank', blank, count: items.length };
-  const img = items[0].querySelector('img');
-  if (img && !img.complete) return { ready: false, why: 'avatar-loading', count: items.length };
+  if (blank === items.length) return { ready: false, why: 'title-blank', blank, count: items.length };
   const box = document.querySelector('.conversationConversationListwrapper');
   if (!box || box.clientHeight <= 0) return { ready: false, why: 'no-container', count: items.length };
-  return { ready: true, count: items.length };
+  return { ready: true, count: items.length, blank, usable: items.length - blank };
 })()"""
 
 # 采集当前窗口的会话：DOM 字段 + React fiber 里的 conversation 模型。
@@ -651,12 +649,12 @@ def scrape_ssr(html):
             raw["not_exist_login_cookie"] = _take(
                 v, r'"not_exist_login_cookie"\s*:\s*(true|false)')
 
-    out["user_id"] = raw.get("odin_user_id") or raw.get("uid")
+    out["user_id"] = raw.get("uid") or raw.get("odin_user_id")
     out["sec_uid"] = raw.get("sec_uid")
-    if out["user_id"] and out["user_id"] != "0":
-        out["verdict"] = "logged_in"
-    elif raw.get("is_login") == "false" or raw.get("not_exist_login_cookie") == "true":
+    if raw.get("is_login") == "false" or raw.get("not_exist_login_cookie") == "true":
         out["verdict"] = "logged_out"
+    elif raw.get("is_login") == "true" and out["user_id"] and out["user_id"] != "0":
+        out["verdict"] = "logged_in"
     elif not out["user_id"] and raw.get("is_login") is None:
         out["verdict"] = "logged_out"
     return out
@@ -835,6 +833,9 @@ class ImMonitor:
                 break
         if route is None:
             return
+        if route == "login":
+            if resp.request.resource_type != "document" or resp.frame != self.page.main_frame:
+                return
 
         try:
             if route == "send" and resp.request.method.upper() != "POST":
@@ -867,7 +868,7 @@ class ImMonitor:
 
     def _handle_login(self, body):
         r = scrape_ssr(body)
-        if r["verdict"] == "logged_in" or self.login["verdict"] == "unknown":
+        if r["verdict"] != "unknown" or self.login["verdict"] == "unknown":
             self.login = r
         label = {"logged_in": "✅ 已登录", "logged_out": "⛔ 未登录", "unknown": "❓ 未知"}
         logger.info(f"[LOGIN] {label.get(self.login['verdict'])}  user_id={self.login['user_id'] or '-'}"
@@ -1158,6 +1159,8 @@ class DouyinIM:
 
         ls = self._wait_list_ready(lg)
         if not ls["ready"]:
+            if ls.get("why") == "logged-out":
+                return self._finish(STATUS_EXPIRED, lg, ls)
             return self._finish(STATUS_TIMEOUT, lg, ls)
 
         return self._finish(STATUS_READY, lg, ls)
@@ -1171,11 +1174,19 @@ class DouyinIM:
         t0 = time.time()
         last = None
         result = {"ready": False, "via": None, "count": 0, "net_complete": False}
+        diagnostic = None
         while time.time() - t0 < self.ready_timeout:
+            if self.mon.login.get("verdict") == "logged_out":
+                result["why"] = "logged-out"
+                break
             try:
                 dom = self.page.evaluate(JS_LIST_READY) or {}
             except Exception:
                 dom = {}
+            current = (dom.get("why", "ready"), dom.get("count", 0), dom.get("blank", 0))
+            if current != diagnostic:
+                logger.info(f"[LIST] 检查 why={current[0]} count={current[1]} blank={current[2]}")
+                diagnostic = current
             if dom.get("ready"):
                 now = time.time()
                 if last and last["count"] == dom["count"] and now - last["at"] >= 1.2:
@@ -1195,7 +1206,13 @@ class DouyinIM:
                         f"  当前渲染 {result['count']} 个会话"
                         f"  has_more={self.mon.list_has_more}")
         else:
-            logger.warning(f"[LIST] ⚠️ {self.ready_timeout:.0f}s 内未判定列表就绪")
+            try:
+                overlay = self.page.evaluate(JS_LOGIN_DOM) or {}
+            except Exception:
+                overlay = {}
+            logger.warning(f"[LIST] ⚠️ {self.ready_timeout:.0f}s 内未判定列表就绪 "
+                           f"why={diagnostic[0] if diagnostic else 'unknown'} "
+                           f"login_visible={bool(overlay.get('loginVisible'))} hits={self.mon.hits}")
         return result
 
     def _finish(self, status, lg, ls=None):

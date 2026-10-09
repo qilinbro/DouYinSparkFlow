@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import quote
 
-from core.douyin_im import DouyinIM
+from core.douyin_im import DouyinIM, JS_LIST_READY
 
 
 @unittest.skipUnless(os.getenv("RUN_BROWSER_INPUT_TESTS") == "1" or os.getenv("TEST_BROWSER_CHANNEL"),
@@ -49,6 +49,18 @@ class BrowserInputTests(unittest.TestCase):
 
     def test_real_mouse_movement_selects_real_input(self):
         self.assertEqual(self.im._input_mode(), "real")
+
+    def test_optional_avatar_and_blank_placeholder_do_not_block_ready_list(self):
+        self.page.evaluate('''() => {
+          const box = document.createElement('div');
+          box.className = 'conversationConversationListwrapper'; box.style.height = '100px';
+          box.innerHTML = '<div data-e2e="conversation-item"><img><span class="conversationConversationItemtitle">Synthetic peer</span></div><div data-e2e="conversation-item"></div>';
+          document.body.append(box);
+          Object.defineProperty(box.querySelector('img'), 'complete', {get: () => false});
+        }''')
+        state = self.page.evaluate(JS_LIST_READY)
+        self.assertTrue(state["ready"])
+        self.assertEqual(state["usable"], 1)
 
     def test_complete_multiline_input_and_one_send_click_without_fake_success(self):
         result = self.im.type_and_send(self.hit, "第一行\nSecond line", timeout=0.3)
