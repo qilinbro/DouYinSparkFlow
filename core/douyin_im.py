@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlsplit
 
 from utils.config import get_config
 from utils.logger import setup_logger
+from utils.receipt_diagnostics import summarize_json_receipt
 
 # 本模块的日志器。名字固定 "douyin_im"，与 core.tasks 的 "app" 分开，
 # 便于单独按 logger 名过滤。级别取自 .env 的 LOG_LEVEL（utils.config 统一读）。
@@ -888,6 +889,8 @@ class ImMonitor:
             try:
                 data = json.loads(body)
                 response_format = "json"
+                logger.warning("[SEND] JSON 诊断 " + json.dumps(summarize_json_receipt(data),
+                               ensure_ascii=True, separators=(",", ":")))
                 if isinstance(data, dict):
                     code = data.get("status_code", data.get("code", data.get("error_code")))
                     if isinstance(code, int) and not isinstance(code, bool):
