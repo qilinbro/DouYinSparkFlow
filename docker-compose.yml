@@ -1,0 +1,48 @@
+#   ① douyin-spark-flow  任务执行器 —— 容器内 cron 到点跑一轮续火花   （对应 DYSparkTask）
+#   ② gost               配套代理   —— 本地 app 抓 Cookie 时借道（对应 DYSparkGost）
+#
+# 用法：
+#   docker compose up -d --build      # 构建并启动两个容器
+#   docker compose logs -f            # 看日志
+#   docker compose down               # 停止
+
+services:
+  # ===========================================================================
+  # ① 任务执行器：容器内 cron 定时跑任务
+  # ===========================================================================
+  douyin-spark-flow:
+    image: crpi-yagm0mg4gyj902wq.cn-hangzhou.personal.cr.aliyuncs.com/oilu/douyinsparkflow:latest
+    container_name: douyin-spark-flow
+    restart: unless-stopped
+    # Chromium 需要较大的 /dev/shm，别删
+    shm_size: 1gb
+    environment:
+      # 镜像入口 docker/entrypoint.sh 按它分派：cron = 容器内定时跑（云函数上要写 fc）
+      # 不写也默认 cron，这里显式声明，免得和云函数那份配置看串
+      LAUNCH_MODE: cron
+      GITHUB_ACTIONS: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # 配置（含 TASKS / COOKIES_* / CRON_HOUR / TZ），只读挂载
+      - ${CONFIG_ENV_FILE:-./config/.env}:/app/.env:ro
+      - ${LOGS_DIR:-./logs}:/app/logs
+
+  # ===========================================================================
+  # ② 配套代理：给本地 app 提供与任务容器一致的出口
+  # ===========================================================================
+  gost:
+    image: crpi-yagm0mg4gyj902wq.cn-hangzhou.personal.cr.aliyuncs.com/oilu/gost:latest
+    # 国内拉 ACR 需要先登录：docker login crpi-yagm0mg4gyj902wq.cn-hangzhou.personal.cr.aliyuncs.com
+    # 不想用 ACR 也可以换成官方镜像 gogost/gost:latest（但要能访问 Docker Hub）
+    container_name: douyin-spark-gost
+    restart: unless-stopped
+    command:
+      - "-L"
+      # 用 http+ws 而不是裸 http：app 那边要求隧道地址以 ws:// 开头，
+      # 这样本地填的写法与云函数场景完全一致，换个部署方式不用改配置。
+      #   下面的 yourGostUser / yourGostPassword 就是隧道凭据，直接改成自己的即可
+      #   明文 ws 暴露在公网，密码务必设成足够长的随机串。
+      - "http+ws://yourGostUser:yourGostPassword@:9000?path=/ws"
+    ports:
+      # 暴露给本地 app 连；宿主机 9000 被占就改左边的端口
+      - "${GOST_PORT:-9000}:9000"

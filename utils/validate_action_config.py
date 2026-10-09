@@ -1,6 +1,7 @@
 """Validate Actions configuration without loading the application or sending messages."""
 
 import json
+import math
 import os
 import re
 import sys
@@ -60,8 +61,24 @@ def validate_cookie(cookie, description: str) -> None:
 
 def validate_environment(environ: Mapping[str, str]) -> ConfigurationSummary:
     for key, default in (
-        ("BROWSER_TIMEOUT", "120000"),
-        ("FRIEND_LIST_WAIT_TIME", "2000"),
+        ("BROWSER_ACTION_TIMEOUT", "120"),
+        ("FRIEND_LIST_WAIT_TIME", "2"),
+    ):
+        value = environ.get(key, default)
+        try:
+            seconds = float(value) if isinstance(value, str) else math.nan
+        except ValueError:
+            seconds = math.nan
+        milliseconds = seconds * 1000
+        if not math.isfinite(milliseconds) or milliseconds < 1:
+            raise ConfigurationError(
+                f"{key} must be a positive number of seconds (at least 0.001)."
+            )
+
+    for key, default in (
+        ("IM_SCAN_TIMEOUT", "120"),
+        ("IM_READY_TIMEOUT", "120"),
+        ("IM_MAX_STEPS", "200"),
         ("TASK_RETRY_TIMES", "3"),
     ):
         value = environ.get(key, default)

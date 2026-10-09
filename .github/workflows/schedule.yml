@@ -8,11 +8,6 @@ on:
         type: boolean
         default: true
         required: true
-      diagnose_only:
-        description: "只检查抖音聊天输入框，不输入或发送消息"
-        type: boolean
-        default: false
-        required: true
   schedule:
     - cron: "0 1 * * *" # 每天北京时间 09:00；GitHub 可能延迟启动
 
@@ -26,7 +21,7 @@ concurrency:
 jobs:
   run-main:
     if: github.ref == 'refs/heads/main'
-    timeout-minutes: 20
+    timeout-minutes: 40
     runs-on: ubuntu-latest
     environment: user-data
     env:
@@ -37,12 +32,20 @@ jobs:
       MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE || '续火花' }}
       HITOKOTO_TYPES: ${{ vars.HITOKOTO_TYPES || '["文学","影视","诗词","哲学"]' }}
       MATCH_MODE: ${{ vars.MATCH_MODE || 'nickname' }}
-      BROWSER_TIMEOUT: ${{ vars.BROWSER_TIMEOUT || '120000' }}
-      FRIEND_LIST_WAIT_TIME: ${{ vars.FRIEND_LIST_WAIT_TIME || '2000' }}
+      # 新版上游统一用秒；BROWSER_TIMEOUT（毫秒）已不再读取。
+      BROWSER_ACTION_TIMEOUT: ${{ vars.BROWSER_ACTION_TIMEOUT || '120' }}
+      FRIEND_LIST_WAIT_TIME: ${{ vars.FRIEND_LIST_WAIT_TIME || '2' }}
+      IM_SCAN_TIMEOUT: ${{ vars.IM_SCAN_TIMEOUT || '120' }}
+      IM_READY_TIMEOUT: ${{ vars.IM_READY_TIMEOUT || '120' }}
+      IM_MAX_STEPS: ${{ vars.IM_MAX_STEPS || '200' }}
       TASK_RETRY_TIMES: ${{ vars.TASK_RETRY_TIMES || '3' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'Info' }}
+      # 版本与校验值必须与 Dockerfile 同步。
+      CLOAK_CHROMIUM_VERSION: "146.0.7680.177.5"
+      CLOAK_BINARY_SHA256: "4a12bcde95fa1bb1beef2b41ab5e5c27c36be78e3be3d0dac8c64d705216670e"
+      CLOAKBROWSER_AUTO_UPDATE: "false"
+      DEBUG: "false"
       PYTHONUNBUFFERED: "1"
-      DIAGNOSE_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -64,25 +67,75 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Install Chromium headless shell
-        run: python -m playwright install chromium --with-deps --only-shell
+      - name: Install Chromium system dependencies
+        run: python -m playwright install-deps chromium
+
+      # 与上游一致补齐 Windows 字体；下载失败只告警，不阻断任务。
+      - name: Install Windows default fonts
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+          font_dir="$(mktemp -d "${RUNNER_TEMP}/windows-fonts.XXXXXX")"
+          mkdir -p "${font_dir}/extracted"
+          curl -fL --connect-timeout 15 --max-time 600 --retry 2 --retry-delay 3 \
+            -o "${font_dir}/fonts.tar.gz" \
+            https://github.com/ErwinLiYH/all_win10_fonts/archive/refs/heads/main.tar.gz
+          tar -xzf "${font_dir}/fonts.tar.gz" -C "${font_dir}/extracted"
+          sudo mkdir -p /usr/share/fonts/truetype/windows
+          count=0
+          while IFS= read -r -d '' font; do
+            sudo cp -n "$font" /usr/share/fonts/truetype/windows/ && count=$((count + 1))
+          done < <(find "${font_dir}/extracted" -type f \( -iname "*.ttf" -o -iname "*.ttc" -o -iname "*.otf" \) -print0)
+          sudo fc-cache -f >/dev/null 2>&1 || true
+          echo "Installed $count Windows font files"
+          fc-list | grep -qiE 'segoe ui|microsoft yahei|simsun|calibri' \
+            && echo "Windows fonts are ready" \
+            || echo "::warning::Required Windows font families were not detected"
+
+      - name: Download verified CloakBrowser Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d "${RUNNER_TEMP}/cloakbrowser-download.XXXXXX")"
+          archive="${download_dir}/browser.tar.gz"
+          extract_dir="${download_dir}/extracted"
+          binary_dir="${RUNNER_TEMP}/cloakbrowser"
+          tag="chromium-v${CLOAK_CHROMIUM_VERSION}"
+          url="https://github.com/CloakHQ/CloakBrowser/releases/download/${tag}/cloakbrowser-linux-x64.tar.gz"
+          curl -fL --connect-timeout 15 --max-time 600 --retry 2 --retry-delay 2 \
+            -o "${archive}" "${url}"
+          printf '%s  %s\n' "${CLOAK_BINARY_SHA256}" "${archive}" | sha256sum -c -
+          mkdir -p "${extract_dir}" "${binary_dir}"
+          tar -xzf "${archive}" -C "${extract_dir}"
+          chrome="$(find "${extract_dir}" -maxdepth 6 -type f -name chrome -perm -u+x -print -quit)"
+          test -n "${chrome}" || { echo "chrome binary not found in archive" >&2; exit 1; }
+          # Chromium 依赖同目录的 ICU、.pak、locales 等，不能只复制 chrome。
+          cp -a "$(dirname "${chrome}")/." "${binary_dir}/"
+          chmod +x "${binary_dir}/chrome"
+          test -f "${binary_dir}/icudtl.dat" || { echo "icudtl.dat is missing" >&2; exit 1; }
+          "${binary_dir}/chrome" --version
+          printf 'CLOAKBROWSER_BINARY_PATH=%s\n' "${binary_dir}/chrome" >> "${GITHUB_ENV}"
 
       - name: Check browser startup
         run: |
           python - <<'PY'
-          from playwright.sync_api import sync_playwright
-          with sync_playwright() as playwright:
-              browser = playwright.chromium.launch(headless=True)
+          from core.browser import get_browser
+          browser = get_browser()
+          if browser is None:
+              raise RuntimeError("CloakBrowser 启动失败。")
+          try:
               page = browser.new_page()
               page.set_content("<title>Browser check</title>")
               assert page.title() == "Browser check"
+          finally:
               browser.close()
-          print("Chromium 启动检查通过。")
+          print("应用 CloakBrowser 启动检查通过；未登录抖音或发送消息。")
           PY
 
       - name: Run DouYin Spark Flow
-        if: github.event_name == 'schedule' || !inputs.validate_only || inputs.diagnose_only
-        run: python main.py
+        if: github.event_name == 'schedule' || !inputs.validate_only
+        run: python main.py task
 
       - name: Upload run logs
         if: ${{ !cancelled() }}

@@ -6,8 +6,6 @@
 ![Playwright](https://img.shields.io/badge/Playwright-%E2%9C%94-green?logo=playwright)
 ![chrome-headless-shell](https://img.shields.io/badge/chrome--headless--shell-%E2%9C%94-brightgreen?logo=googlechrome)
 
-> `dev`分支迁移到`https://www.douyin.com/chat` 加载更稳定，支持通过备注/昵称/抖音号等多种方式智能匹配。由于`https://www.douyin.com/chat`没经过长期测试，该分支目前暂不合并。有能力的可以研究一下
-
 ## 贡献者
 
 感谢所有为本项目做出贡献的开发者：
@@ -18,38 +16,37 @@
 
 **抖音火花自动续火脚本**一款轻量实用的抖音互动脚本，可自动为你和抖音好友续火花，无需手动操作。
 
-✅ 支持 GitHub Actions 自动运行（开箱即用的 Workflow 配置）
+![界面展示](docs/images/屏幕截图%202026-10-05%20190345.png)
 
-✅ 也可源码部署至自有服务器，青龙/白虎等任务管理面板，灵活适配个人使用场景
+✅ 支持 可视化应用，操作简单方便
+
+✅ 支持 Docker 部署
+
+✅ 可安装在挂机宝长期托管，也可安装到个人日常电脑日常开机静默执行
 
 ### 特性/优势
 
-- [x] 在线可视化配置工具，新手也能入门操作
-- [x] Fork即用，无需克隆代码，配置运行环境
+- [x] 可视化应用，新手也能入门操作
 - [x] 多用户,同时批量支持多个账户
 - [x] 多目标,一个账户支持多个续火花目标
-- [x] 支持按照昵称和抖音号两种方式查找好友目标
+- [x] 支持按照昵称和抖音号多种方式查找好友目标
 - [x] 一言支持,更丰富的消息文本
+- [x] 使用CloakBrowser，稳定自动化操作环境，降低被判别为机器的风险
 
-使用`PlayWright`以及`chrome-headless-shell`自动化操作[抖音创作者中心](https://creator.douyin.com/)，进行定时发送抖音消息来续火花
+使用`CloakBrowse`（基于PlayWright）自动化操作[抖音聊天网页版](https://www.douyin.com/chat)，进行定时发送抖音消息来续火花
 
 ## 🚀 使用方法
 
-**材料准备：** 一个 GitHub 账号和可用浏览器即可，不设额外门槛。
-
-**编辑项目配置：** 保姆级教程见 [配置生成器使用](docs/配置生成器使用.md)
-
-**部署方法：**
-
-1. Github Action 部署（推荐👍），操作说明见 [Action部署说明](docs/Action部署说明.md)
-
-2. 源码部署 （更适合高级用户），操作说明见[源代码部署说明](docs/源代码部署说明.md)
+保姆级教程见 [项目文档-https://oilu.cn/DouYinSparkFlow](https://oilu.cn/DouYinSparkFlow)
 
 ## 📢交流讨论
 
 已开放讨论区，有疑问或展示相关成果，发布话题需求的可以加入讨论
 
 [跳转讨论区](https://github.com/2061360308/DouYinSparkFlow/discussions)
+
+此外创建了一个QQ群，用于收集反馈信息，交流讨论，[点此加入](https://qun.qq.com/universal-share/share?ac=1&authKey=r6QyQAfAdjDnardyxro5kycsnF%2BdsLBTGUPWh7gFxqutzbbVF2shbgmqNJyCRdbZ&busi_data=eyJncm91cENvZGUiOiIxMDkxNjUxNDYyIiwidG9rZW4iOiJPdlB6dDU2Y2RxMzZ3L2ZWU01LNWtxM0ZWSW56QzlpSmZ5dnZVYWI3dzJWY2hVQmROeHZHN3QwdEpvUGJsc0JnIiwidWluIjoiMjA2MTM2MDMwOCJ9&data=L-_Gkg2cVrzDBW6FWJnD31g0RDbq67_YR0WK17hkRrMetritPsn3gvtBMXpTmY8Y8UZDlwY9qz5liHbbG3YDlg&svctype=4&tempid=h5_group_info
+)
 
 ## ⭐Star 趋势
 
