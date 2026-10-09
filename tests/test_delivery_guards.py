@@ -152,6 +152,57 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(mon.errors, [])
 
 
+class SendRouteTests(unittest.TestCase):
+    def response(self, url):
+        # Synthetic protobuf envelope and conversation identifier only.
+        return SimpleNamespace(
+            url=url,
+            status=200,
+            headers={"content-type": "application/x-protobuf"},
+            request=SimpleNamespace(method="POST", resource_type="fetch",
+                                    post_data_buffer=b"0:1:100:200"),
+            body=MagicMock(return_value=bytes([0x18, 0, 0x22, 2, 0x4f, 0x4b])),
+        )
+
+    def test_similar_urls_are_not_send_receipts(self):
+        urls = (
+            "https://not-imapi.douyin.com/v1/message/send",
+            "https://imapi.douyin.com.evil.example/v1/message/send",
+            "https://example.invalid/?next=https://imapi.douyin.com/v1/message/send",
+            "https://imapi.douyin.com/v1/message/send_ack",
+            "https://imapi.douyin.com/v1/message/send/ack",
+            "http://imapi.douyin.com/v1/message/send",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                mon = ImMonitor(FakePage())
+                response = self.response(url)
+                mon._on_response(response)
+                response.body.assert_not_called()
+                self.assertEqual(mon.sends, [])
+                self.assertEqual(mon.hits, {})
+                self.assertEqual(mon.errors, [])
+
+    def test_exact_send_endpoint_accepts_query_and_optional_trailing_slash(self):
+        urls = (
+            "https://imapi.douyin.com/v1/message/send",
+            "https://imapi.douyin.com/v1/message/send?aid=123",
+            "https://imapi.douyin.com/v1/message/send/",
+            "https://imapi.douyin.com/v1/message/send/?aid=123",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                mon = ImMonitor(FakePage())
+                response = self.response(url)
+                mon._on_response(response)
+                response.body.assert_called_once_with()
+                self.assertEqual(mon.hits, {"send": 1})
+                self.assertEqual(len(mon.sends), 1)
+                self.assertTrue(mon.sends[0]["ok"])
+                self.assertEqual(mon.sends[0]["conv_id"], "0:1:100:200")
+                self.assertEqual(mon.errors, [])
+
+
 class SendGuardTests(unittest.TestCase):
     def test_selection_requires_known_matching_conversation_id(self):
         im = object.__new__(DouyinIM)

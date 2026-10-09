@@ -27,6 +27,32 @@ class ReceiptDiagnosticTests(unittest.TestCase):
         self.assertEqual(summarize_json_receipt(["private-value"])["root_type"], "list")
         self.assertNotIn("private", json.dumps(summarize_json_receipt(["private-value"])))
 
+    def test_unknown_wrapper_exposes_only_safe_nested_status_and_types(self):
+        summary = summarize_json_receipt({"private-user-as-key": {
+            "status_code": 8, "message": "private-text", "private-id-as-key": "private-token"}})
+        self.assertEqual(summary["codes"], {"<unknown0>.status_code": 8})
+        self.assertEqual(summary["unknown_value_type_counts"], {"dict": 1, "str": 1})
+        self.assertNotIn("private", json.dumps(summary))
+
+    def test_unknown_wrappers_in_lists_can_reveal_business_status(self):
+        summary = summarize_json_receipt({"private-wrapper": [{"check_code": 100}]})
+        self.assertEqual(summary["codes"], {"<unknown0>[0].check_code": 100})
+        self.assertNotIn("private", json.dumps(summary))
+
+    def test_empty_challenge_field_is_not_a_verification_request(self):
+        for value in (None, "", {}, []):
+            summary = summarize_json_receipt({"bdturing": value})
+            self.assertTrue(summary["challenge_fields_present"])
+            self.assertFalse(summary["challenge_value_nonempty"])
+
+    def test_unknown_wrapper_recursion_is_bounded(self):
+        response = {"status_code": 8}
+        for _ in range(20):
+            response = {"private-wrapper": response}
+        summary = summarize_json_receipt(response)
+        self.assertEqual(summary["codes"], {})
+        self.assertNotIn("private", json.dumps(summary))
+
 
 if __name__ == "__main__":
     unittest.main()

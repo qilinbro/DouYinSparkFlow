@@ -842,6 +842,12 @@ class ImMonitor:
         if route == "login":
             if resp.request.resource_type != "document" or resp.frame != self.page.main_frame:
                 return
+        if route == "send":
+            # A substring can also occur in a different path, host or URL query.
+            endpoint = urlsplit(url)
+            if (endpoint.scheme != "https" or endpoint.hostname != "imapi.douyin.com"
+                    or endpoint.path not in ("/v1/message/send", "/v1/message/send/")):
+                return
 
         try:
             if route == "send" and resp.request.method.upper() != "POST":
@@ -861,6 +867,15 @@ class ImMonitor:
                 posted = resp.request.post_data_buffer or b""
                 match = re.search(rb"(?:^|[^\d:])(\d+:1:\d+:\d+)(?![\d:])", posted)
                 conv_id = match.group(1).decode("ascii") if match else None
+                resource = getattr(resp.request, "resource_type", "unknown")
+                mime = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                logger.info("[SEND] 请求状态 " + json.dumps({
+                    "host": "imapi.douyin.com", "path": endpoint.path,
+                    "resource_type": resource if resource in ("fetch", "xhr", "other") else "unknown",
+                    "response_mime": mime if mime in ("application/json", "application/x-protobuf",
+                        "application/octet-stream", "text/html", "text/plain") else "other",
+                    "response_bytes": len(body),
+                }, separators=(",", ":")))
                 self._handle_send(body, resp.status, resp.headers.get("content-type", ""), conv_id)
             elif route == "init":
                 self._handle_init(body)
