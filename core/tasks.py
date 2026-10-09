@@ -1,3 +1,4 @@
+import os
 import traceback
 from datetime import datetime
 
@@ -13,15 +14,24 @@ userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
 
 
-def do_user_task(browser, username, cookies, targets):
+def _test_send_limit():
+    """0 表示正常任务；正整数仅用于限制本轮真实发送尝试。"""
+    value = int(os.getenv("TEST_MAX_SENDS", "0"))
+    if value < 0:
+        raise ValueError("TEST_MAX_SENDS 必须为非负整数")
+    return value
+
+
+def do_user_task(browser, username, cookies, targets, max_sends=None):
     """一个账号的完整流程：门禁 → 滚动找人 → 发送 → 回执确认。
 
     实现委托给 `core.douyin_im.DouyinIM`：
       任务一（门禁）    DouyinIM 构造时自动完成，结论在 wait_ready() 里
       任务二（找人）    iter_find_and_select —— yield 时该会话已选中且 conv_id 已校验
-      任务三（发送）    im.type_and_send —— 真实键盘事件 + HTTP/DOM 回执双确认
+      任务三（发送）    im.type_and_send —— 完整输入 + 服务端回执确认，DOM 单独记录
     拟人化节奏由 cloakbrowser 的 humanize 负责，这里不再叠加延迟。
     """
+    max_sends = _test_send_limit() if max_sends is None else max_sends
     context = browser.new_context()  # 每个任务使用独立的上下文
     context.set_default_navigation_timeout(
         config["browserActionTimeout"]
@@ -62,6 +72,8 @@ def do_user_task(browser, username, cookies, targets):
                 "reason": reason,
                 "sent_ok": 0,
                 "sent_fail": 0,
+                "attempted": 0,
+                "limited": False,
                 "missing": [],
                 "note": "",
             }
@@ -71,54 +83,65 @@ def do_user_task(browser, username, cookies, targets):
             f"nickname={res.get('nickname')} 会话列表就绪"
         )
 
-        sent_ok = sent_fail = 0
+        sent_ok = sent_fail = attempted = 0
+        limited = False
 
         # 生成器：yield 出来的那一刻，对应好友的会话已经被选中
-        for friend in im.iter_find_and_select(targets):
-            logger.debug(f"账号 {username} 已选中好友 {friend['display']}，准备发送")
-            message = build_message()
-            r = im.type_and_send(friend, message)
-            if r["ok"]:
-                sent_ok += 1
-                logger.info(
-                    f"账号 {username} → {friend['display']} 发送成功"
-                    f"（{r.get('via')} message_id={r.get('message_id') or '-'}）"
-                )
-            else:
-                sent_fail += 1
-                # 重试一次：用 conv_id 重新选中（列表可能已滚动，原来的下标失效）
-                logger.warning(
-                    f"账号 {username} → {friend['display']} 未拿到回执，重试一次"
-                )
-                try:
-                    if friend.get("reselect") and friend["reselect"]():
-                        r2 = im.type_and_send(friend, message)
-                        if r2["ok"]:
-                            sent_ok += 1
-                            sent_fail -= 1
-                            logger.info(
-                                f"账号 {username} → {friend['display']} 重试成功"
-                            )
-                except Exception:
-                    logger.warning(traceback.format_exc())
-            # 发送完让列表状态落定，再继续滚动（发送会把该会话移到顶部）
-            page.wait_for_timeout(800)
+        friends = im.iter_find_and_select(targets)
+        try:
+            for friend in friends:
+                logger.debug(f"账号 {username} 已选中好友 {friend['display']}，准备发送")
+                message = build_message()
+                attempted += 1
+                r = im.type_and_send(friend, message)
+                if r.get("ok"):
+                    sent_ok += 1
+                    logger.info(
+                        f"账号 {username} → {friend['display']} 服务端确认接受"
+                        f"（{r.get('via')} message_id={r.get('message_id') or '-'}）"
+                    )
+                else:
+                    sent_fail += 1
+                    reason = r.get("reason") or "receipt-unconfirmed"
+                    logger.error(
+                        f"账号 {username} → {friend['display']} 发送失败或未确认："
+                        f"reason={reason} code={r.get('code')} status={r.get('status')}"
+                        f" DOM显示={bool(r.get('dom_observed'))}；本轮不自动重发"
+                    )
+                if max_sends and attempted >= max_sends:
+                    limited = True
+                    logger.info(f"账号 {username} 受限测试：已尝试 {attempted} 次，停止后续发送")
+                    break
+                # 发送完让列表状态落定，再继续滚动（发送会把该会话移到顶部）
+                page.wait_for_timeout(800)
+        finally:
+            # 提前结束也释放扫描生成器持有的状态，不继续选中另一个会话。
+            if hasattr(friends, "close"):
+                friends.close()
 
         scan = im.last_scan or {}
-        logger.info(
-            f"账号 {username} 扫描结束：停止原因={scan.get('stopped')} "
-            f"步数={scan.get('steps')} 访问会话={scan.get('visited')} "
-            f"发送成功={sent_ok} 发送失败={sent_fail}"
+        stopped = "test-limit" if limited else scan.get("stopped")
+        missing = [] if limited else list(scan.get("missing") or [])
+        select_failed = list(scan.get("select_failed") or [])
+        if limited and not select_failed:
+            select_failed = [c.get("display") for c in getattr(im, "_select_failed", [])]
+        scanned_all = bool(scan.get("scanned_all")) and scan.get("stopped") in (
+            "all-found", "reach-bottom", "no-move"
         )
-        if scan.get("missing"):
+        logger.info(
+            f"账号 {username} 扫描结束：停止原因={stopped} "
+            f"步数={scan.get('steps')} 访问会话={scan.get('visited')} "
+            f"发送成功={sent_ok} 发送失败={sent_fail} 已尝试={attempted}"
+        )
+        if missing:
             # 这两句必须区分开：scanned_all=False 时"没找到"不代表"不存在"
             logger.warning(
-                f"账号 {username} 未找到的目标：{scan['missing']}"
+                f"账号 {username} 未找到的目标：{missing}"
                 f"（{scan.get('note')}）"
             )
-        if scan.get("select_failed"):
+        if select_failed:
             logger.warning(
-                f"账号 {username} 找到但选中失败：{scan['select_failed']}"
+                f"账号 {username} 找到但选中失败：{select_failed}"
             )
 
         folds = im.fold_groups()
@@ -127,13 +150,28 @@ def do_user_task(browser, username, cookies, targets):
                 f"账号 {username} 注意：折叠组/陌生人组里有内容 {folds}，"
                 f"主列表扫不到，目标可能被折叠"
             )
+        failures = []
+        if sent_fail:
+            failures.append(f"发送失败或未确认 {sent_fail} 个")
+        if select_failed:
+            failures.append(f"选中失败 {len(select_failed)} 个")
+        if not limited and not scanned_all:
+            failures.append(f"扫描未完成（{scan.get('stopped') or 'unknown'}）")
+        if missing:
+            failures.append(f"未找到目标 {len(missing)} 个")
+        if not attempted:
+            failures.append("未找到可安全发送的目标")
         return {
-            "ok": True,
-            "reason": "",
+            "ok": not failures,
+            "reason": "；".join(failures),
             "sent_ok": sent_ok,
             "sent_fail": sent_fail,
-            "missing": list(scan.get("missing") or []),
-            "note": scan.get("note") or "",
+            "attempted": attempted,
+            "limited": limited,
+            "missing": missing,
+            "select_failed": select_failed,
+            "scanned_all": scanned_all,
+            "note": "受限测试，后续目标未执行" if limited else (scan.get("note") or ""),
         }
     finally:
         if im is not None:
@@ -147,11 +185,18 @@ def do_user_task(browser, username, cookies, targets):
 def runTasks():
     """跑一轮所有账号的任务。
 
-    返回进程退出码：任一账号门禁失败或抛异常 → 1，否则 0。
-    「部分好友没找到 / 发送失败」不计入整体失败（可能只是改名），只记日志。
-    调度器靠这个退出码判断「今天是否算成功执行」。
+    返回进程退出码：任一账号门禁/发送失败、目标缺失、扫描未完成或异常 → 1。
+    受限测试仅以实际尝试的结果判断成败，不把主动截断的目标计作缺失。
     """
     logger.info("开始执行任务")
+    try:
+        max_sends = _test_send_limit()
+    except (TypeError, ValueError):
+        logger.error("TEST_MAX_SENDS 必须为非负整数，任务未执行")
+        return 1
+    if not userData:
+        logger.error("没有可执行的账号任务")
+        return 1
     logger.debug(f"当前配置如下：")
     logger.debug(f"消息模板: {config.get('messageTemplate', '未找到消息模板')}")
     logger.debug(f"一言类型: {config['hitokotoTypes']}")
@@ -161,8 +206,12 @@ def runTasks():
         )
 
     failed = 0
+    attempted = 0
     results: list = []
     for user in userData:
+        if max_sends and attempted >= max_sends:
+            logger.info(f"本轮受限测试已尝试 {attempted} 次，其余账号不再执行")
+            break
         cookies = user["cookies"]
         # 归一化只在这里做（配置读取端不做）：DouyinIM._match 内部也用同一套 norm，
         # 两边都归过才谈得上相等，否则配置里的「Ｌｕ瞳」永远匹配不上页面上的「Lu瞳」。
@@ -174,11 +223,13 @@ def runTasks():
         browser = None
         try:
             browser = get_browser(fingerprint)
-            result = do_user_task(browser, username, cookies, targets)
+            remaining = max_sends - attempted if max_sends else 0
+            result = do_user_task(browser, username, cookies, targets, max_sends=remaining)
+            attempted += int(result.get("attempted") or 0)
             results.append((username, result))
             if not result.get("ok"):
                 failed += 1
-                logger.error(f"账号 {username} 任务失败")
+                logger.error(f"账号 {username} 任务失败：{result.get('reason') or 'unknown'}")
             else:
                 logger.info(f"账号 {username} 任务完成")
         except Exception:
@@ -191,12 +242,18 @@ def runTasks():
                         "reason": "任务异常",
                         "sent_ok": 0,
                         "sent_fail": 0,
+                        "attempted": 0,
+                        "limited": False,
                         "missing": [],
                         "note": "",
                     },
                 )
             )
             logger.error(f"账号 {username} 任务异常：\n{traceback.format_exc()}")
+            if max_sends:
+                # 异常可能发生在发送已触发之后，不能再给下一个账号分配测试预算。
+                logger.warning("受限测试遇到异常，停止后续账号以避免额外发送")
+                break
         finally:
             if browser is not None:
                 try:
@@ -234,6 +291,8 @@ def _notify_summary(results: list, failed: int) -> None:
         else:
             line = f"❌ {username}：{r.get('reason') or '任务失败'}"
         lines.append(line)
+        if r.get("limited"):
+            lines.append(f"　受限测试：已尝试 {int(r.get('attempted') or 0)} 次，后续目标未执行")
         if r.get("missing"):
             lines.append(f"　未找到：{'、'.join(str(x) for x in r['missing'])}")
     lines.append("————————————")

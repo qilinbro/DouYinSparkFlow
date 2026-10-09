@@ -30,7 +30,7 @@ import traceback
 import json
 import re
 import unicodedata
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from utils.config import get_config
 from utils.logger import setup_logger
@@ -350,11 +350,20 @@ JS_TYPE_LINE = """((p) => {
   return res;
 })"""
 
+JS_EDITOR_STATUS = """((p) => {
+  const ed = document.querySelector('[data-e2e="msg-input"] .public-DraftEditor-content')
+          || document.querySelector('.DraftEditor-root [contenteditable="true"]')
+          || document.querySelector('[data-e2e="msg-input"] [contenteditable="true"]');
+  const text = ed ? (ed.textContent || '') : '';
+  const clean = s => s.replace(/[\\s\\u200b-\\u200d\\ufeff]+/g, '');
+  const b = document.querySelector('.messageMsgInputpublishBtn.messageMsgInputpublishRedBtn');
+  return {exists: !!ed, chars: text.length, matches: !!ed && clean(text) === clean(p.text),
+          sendReady: !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true'};
+})"""
+
 JS_CLICK_SEND = """(() => {
-  const b = document.querySelector('.messageMsgInputpublishBtn.messageMsgInputpublishRedBtn')
-         || document.querySelector('[data-e2e="msg-send"]')
-         || document.querySelector('.messageMsgInputpublishBtn');
-  if (!b) return null;
+  const b = document.querySelector('.messageMsgInputpublishBtn.messageMsgInputpublishRedBtn');
+  if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return null;
   for (const t of ['mousedown', 'mouseup', 'click']) {
     b.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
   }
@@ -828,6 +837,8 @@ class ImMonitor:
             return
 
         try:
+            if route == "send" and resp.request.method.upper() != "POST":
+                return  # OPTIONS 预检不是发送回执。
             body = resp.body()
         except Exception as e:
             self.errors.append((url, str(e)))
@@ -840,7 +851,10 @@ class ImMonitor:
             if route == "login":
                 self._handle_login(body)
             elif route == "send":
-                self._handle_send(body)
+                posted = resp.request.post_data_buffer or b""
+                match = re.search(rb"(?:^|[^\d:])(\d+:1:\d+:\d+)(?![\d:])", posted)
+                conv_id = match.group(1).decode("ascii") if match else None
+                self._handle_send(body, resp.status, resp.headers.get("content-type", ""), conv_id)
             elif route == "init":
                 self._handle_init(body)
             elif route == "userInfo":
@@ -859,13 +873,36 @@ class ImMonitor:
         logger.info(f"[LOGIN] {label.get(self.login['verdict'])}  user_id={self.login['user_id'] or '-'}"
                     + (f"  nickname={self.login['nickname']}" if self.login["nickname"] else ""))
 
-    def _handle_send(self, body):
+    def _handle_send(self, body, http_status=200, content_type="", conv_id=None):
         r = decode_send_resp(body)
+        r["reason"] = "accepted" if r["ok"] else "receipt-unconfirmed"
+        if not 200 <= http_status < 300:
+            r["ok"] = False
+            r["reason"] = "rejected"
+        elif r.get("code") is not None and r["code"] != 0:
+            r["reason"] = "rejected"
+        response_format = "protobuf"
+        if r.get("code") is None:
+            response_format = "unrecognized"
+            try:
+                data = json.loads(body)
+                response_format = "json"
+                if isinstance(data, dict):
+                    code = data.get("status_code", data.get("code", data.get("error_code")))
+                    if isinstance(code, int) and not isinstance(code, bool):
+                        r["code"] = code
+                        if code != 0:
+                            r["reason"] = "rejected"
+            except (ValueError, UnicodeError):
+                pass
         r["at"] = time.time()
+        r["conv_id"] = conv_id
         self.sends.append(r)
         _msg = (f"[SEND] {'✅ 成功' if r['ok'] else '❌ 失败'}  code={r['code']}  "
                 f'status="{r["status"]}"'
-                + (f"  message_id={r['message_id']}" if r["message_id"] else ""))
+                + (f"  message_id={r['message_id']}" if r["message_id"] else "")
+                + f" http_status={http_status} format={response_format} reason={r['reason']}"
+                + f" request_bound={bool(conv_id)}")
         (logger.info if r["ok"] else logger.warning)(_msg)
 
     def _handle_init(self, body):
@@ -1238,7 +1275,7 @@ class DouyinIM:
             for item in new_items:
                 self._join(item)
 
-            # 匹配：备注 > 昵称 > 抖音号 > uid > 标题 > 子串
+            # 仅精确匹配，群聊不能作为好友任务的目标。
             for item in new_items:
                 key, how = self._match(item, pending)
                 if not key:
@@ -1295,10 +1332,12 @@ class DouyinIM:
         failed_windows = 0
         stopped = "exhausted"
         finished = False        # while 自然跑完才算扫全；被外部 break 不算
-        t0 = time.time()
+        self._walk_stat = {"stopped": "walking", "steps": 0, "seen": seen}
+        t0 = time.monotonic()
+        caller_elapsed = 0.0
         try:
             while steps < self.max_steps:
-                if time.time() - t0 > self.timeout:
+                if time.monotonic() - t0 - caller_elapsed > self.timeout:
                     stopped = "timeout"
                     logger.warning(f"[SCAN] ⏱ 扫描超时（{self.timeout:.0f}s）")
                     break
@@ -1324,7 +1363,12 @@ class DouyinIM:
                 if new_items:
                     self._settle()                      # 等 /im/user/info 落定
 
-                yield new_items
+                # 调用方选中/发送/等待回执不消耗列表扫描的时间预算。
+                paused_at = time.monotonic()
+                try:
+                    yield new_items
+                finally:
+                    caller_elapsed += time.monotonic() - paused_at
 
                 # ---- 推进 ----
                 probe = self._scroll_probe()
@@ -1367,7 +1411,8 @@ class DouyinIM:
             # 「stopped 还是初始值」+「while 没跑完」= 调用方提前 break，
             # 不能报 scanned_all —— 那会让 missing 被误读成"确实不存在"。
             if not finished and stopped == "exhausted":
-                stopped = "caller-break"
+                stopped = ("all-found" if self._walk_stat.get("stopped") == "all-found"
+                           else "caller-break")
             self._scan_cache = seen
             self._walk_stat = {"stopped": stopped, "steps": steps, "seen": seen}
 
@@ -1398,7 +1443,8 @@ class DouyinIM:
                 f"[SCAN] ⚠️ 监听层有 {len(self.mon.errors)} 条响应读取失败（卡顿多半来自这里）："
             )
             for url, err in self.mon.errors[:5]:
-                logger.warning(f"        {url} → {err}")
+                parsed = urlsplit(url)
+                logger.warning(f"        {parsed.scheme}://{parsed.netloc}{parsed.path} → {err}")
             if len(self.mon.errors) > 5:
                 logger.warning(f"        …另有 {len(self.mon.errors) - 5} 条")
 
@@ -1502,7 +1548,9 @@ class DouyinIM:
                 return
 
     def _match(self, item, pending):
-        """匹配目标。优先级：备注 > 昵称 > 抖音号 > uid/sec_uid > 标题 > 子串。"""
+        """好友任务只精确匹配备注、昵称、账号标识或标题，不匹配群聊。"""
+        if item.get("is_group") or _is_group(item.get("conv_id"), None, None):
+            return None, None
         order = ("remark", "nickname", "douyin_id", "uid", "sec_uid", "title")
         for field in order:
             val = item.get(field)
@@ -1511,12 +1559,6 @@ class DouyinIM:
             n = _norm(val)
             if n and n in pending:
                 return n, field
-        # 子串兜底：目标出现在显示名里
-        joined = " ".join(_norm(item.get(f) or "") for f in
-                          ("display", "title", "nickname", "remark"))
-        for n, raw in pending.items():
-            if n and n in joined:
-                return n, "fuzzy"
         return None, None
 
     def _snooze(self, ms: int, label: str = "等待") -> None:
@@ -1563,6 +1605,8 @@ class DouyinIM:
         用来区分「点击没生效」和「选中了但检测不到」。
         """
         want = item.get("conv_id")
+        if not want:
+            return False
         modes = (("jsclick", "cdp", "mouse") if self._input_mode() == "synth"
                  else ("mouse", "elclick", "jsclick"))
         if attempts is not None:
@@ -1609,14 +1653,14 @@ class DouyinIM:
                 cur = None
                 for _ in range(12):          # 最多 ~2.4s，出现即退出
                     cur = self._current_conv()
-                    if cur and (not want or not cur.get("convId") or cur["convId"] == want):
+                    if cur and cur.get("convId") == want:
                         break
                     if probe["hit"] and probe["t"] >= t0:
                         break
                     self.page.wait_for_timeout(200)
                 net = probe["hit"] and probe["t"] >= t0
 
-                if cur and (not want or not cur.get("convId") or cur["convId"] == want):
+                if cur and cur.get("convId") == want:
                     logger.warning(f"[SEL] ✅ 成功 方式={mode}  网络信号={net}  "
                                    f"conv_id={cur.get('convId')}  title={cur.get('title')}")
                     return True
@@ -1655,10 +1699,10 @@ class DouyinIM:
         return None
 
     JS_INPUT_HOOK = """(() => {
-      if (window.__imevHooked) return;
+      if (window.__imevHooked) return 'hooked:true';
       window.__imevHooked = true;
       window.__imev = [];
-      for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click']) {
+      for (const t of ['pointermove', 'mousemove', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click']) {
         document.addEventListener(t, e => {
           try {
             const tgt = e.target;
@@ -1752,7 +1796,7 @@ class DouyinIM:
             self.page.mouse.move(2, 2)
             self.page.wait_for_timeout(300)
             ev = self.page.evaluate("() => (window.__imev || []).splice(0)") or []
-            mode = "real" if ev else "synth"
+            mode = "real" if any(e.get("trusted") and e.get("t") in ("pointermove", "mousemove") for e in ev) else "synth"
         except Exception:
             mode = "synth"
         self._input_mode_cache = mode
@@ -1794,6 +1838,11 @@ class DouyinIM:
             raise ValueError("hit is None")
         if not text:
             raise ValueError("text is empty")
+        is_group = hit.get("is_group")
+        if is_group is None:
+            is_group = _is_group(hit.get("conv_id"), None, None)
+        if is_group is not False:
+            raise RuntimeError("目标未确认是好友单聊，拒绝发送")
 
         # ① 草稿残留自查：上一条没清干净会导致两条消息串发
         try:
@@ -1843,10 +1892,8 @@ class DouyinIM:
             want_len = sum(len(l) for l in lines)
             logger.debug(f"[SEND] 合成输入={steps}  已键入={typed}/{want_len}  输入框为空={empty_now}")
             if typed < want_len:
-                logger.warning(f"[SEND] ⚠️ 合成输入缺行：已键入 {typed} 字，应为 {want_len} 字"
-                               f"（lines={lines}）")
-                if typed == 0:
-                    raise RuntimeError("合成输入一行都没进去，拒绝发送空消息")
+                logger.warning(f"[SEND] ⚠️ 合成输入缺行：已键入 {typed} 字，应为 {want_len} 字")
+                raise RuntimeError("输入不完整，拒绝发送")
         else:
             editor = self._editor()
             if editor is None:
@@ -1858,18 +1905,35 @@ class DouyinIM:
                 if i != len(lines) - 1:
                     self.page.keyboard.press("Shift+Enter")
 
+        # 真实输入和合成输入都检查完整内容，避免发送空草稿或只发第一行。
+        input_state = self.page.evaluate(JS_EDITOR_STATUS, {"text": "\n".join(lines)})
+        logger.info(f"[SEND] 输入检查 mode={self._input_mode()} "
+                    f"chars={input_state.get('chars', 0)} complete={bool(input_state.get('matches'))} "
+                    f"send_ready={bool(input_state.get('sendReady'))}")
+        if not input_state.get("matches"):
+            raise RuntimeError("输入框内容与待发送消息不一致，拒绝发送")
+        if not input_state.get("sendReady"):
+            return {"ok": False, "confirmed": False, "via": None,
+                    "reason": "send-not-triggered", "dom_observed": False,
+                    "conv_id": hit.get("conv_id"), "display": hit.get("display")}
+
         sends_before = len(self.mon.sends)
         msg_before = self._msg_state()
 
         # ③ 发送：按钮优先（有内容时变红可点），退化到回车
         how = self._js_click_send() if self._input_mode() == 'synth' else self._click_send()
-        logger.debug(f"[SEND] 发送方式={how}  conv_id={hit.get('conv_id')}")
+        logger.info(f"[SEND] 发送操作 method={how or 'none'}")
+        if not how:
+            return {"ok": False, "confirmed": False, "via": None,
+                    "reason": "send-not-triggered", "dom_observed": False,
+                    "conv_id": hit.get("conv_id"), "display": hit.get("display")}
 
         if not wait_receipt:
-            return {"ok": True, "via": how, "conv_id": hit.get("conv_id"),
+            return {"ok": False, "confirmed": False, "reason": "receipt-unconfirmed",
+                    "via": how, "conv_id": hit.get("conv_id"),
                     "display": hit.get("display")}
 
-        rc = self._wait_receipt(sends_before, msg_before, text, timeout)
+        rc = self._wait_receipt(sends_before, msg_before, text, timeout, hit.get("conv_id"))
         if rc["http"]:
             h = rc["http"]
             (logger.info if h["ok"] else logger.warning)(
@@ -1879,9 +1943,13 @@ class DouyinIM:
             logger.debug(f"[SEND] ✅ DOM 确认：消息数 {msg_before.get('count', '?')} "
                          f"→ {rc['dom']['count']}，最后一条是自己发的")
         if not rc["ok"]:
-            logger.warning(f"[SEND] ⚠️ {timeout:.0f}s 内没拿到回执（可能走 WS 通道，或发送被拦）")
+            logger.warning(f"[SEND] ⚠️ 未确认服务端接受 reason={rc['reason']} "
+                           f"dom_observed={bool(rc['dom'])}")
         return {
             "ok": rc["ok"],
+            "confirmed": rc["ok"],
+            "reason": rc["reason"],
+            "dom_observed": bool(rc["dom"]),
             "via": ("http+dom" if rc["http"] and rc["dom"] else
                     "http" if rc["http"] else "dom" if rc["dom"] else None),
             "message_id": (rc["http"] or {}).get("message_id"),
@@ -1920,16 +1988,17 @@ class DouyinIM:
         self.page.keyboard.press("Enter")
         return "enter"
 
-    def _wait_receipt(self, sends_before, msg_before, text, timeout):
-        """回执双确认：HTTP 监听（权威）+ DOM（WS 通道下补位）。"""
-        t0 = time.time()
+    def _wait_receipt(self, sends_before, msg_before, text, timeout, conv_id=None):
+        """服务端回执确认；DOM 气泡仅记录，不能证明消息已接受。"""
+        t0 = time.monotonic()
         http = dom = None
-        while time.time() - t0 < timeout:
-            if http is None:
-                for rec in self.mon.sends[sends_before:]:
-                    if rec.get("ok"):
-                        http = rec
-                        break
+        while time.monotonic() - t0 < timeout:
+            for rec in self.mon.sends[sends_before:]:
+                if conv_id is not None and rec.get("conv_id") != conv_id:
+                    continue  # 前一会话的延迟回执不能确认当前消息。
+                if rec.get("ok") or rec.get("reason") == "rejected":
+                    http = rec
+                    break
             if dom is None:
                 st = self._msg_state()
                 if (st.get("count", 0) > msg_before.get("count", 0)
@@ -1937,14 +2006,16 @@ class DouyinIM:
                     head = (text or "")[:8]
                     if not head or (st.get("lastText") or "").startswith(head):
                         dom = st
+            if http and not http.get("ok"):
+                break
             if http and dom:
                 break
-            if http and time.time() - t0 > 1.0:
-                break
-            if dom and time.time() - t0 > 2.0:
+            if http and time.monotonic() - t0 > 1.0:
                 break
             self.page.wait_for_timeout(150)
-        return {"ok": bool(http or dom), "http": http, "dom": dom}
+        ok = bool(http and http.get("ok"))
+        return {"ok": ok, "http": http, "dom": dom,
+                "reason": "accepted" if ok else "rejected" if http else "receipt-unconfirmed"}
 
     # -------------------------------------------------------------- 其它
 

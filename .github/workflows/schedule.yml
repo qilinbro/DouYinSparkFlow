@@ -8,6 +8,11 @@ on:
         type: boolean
         default: true
         required: true
+      test_once:
+        description: "实际运行时只试发一条，确认回执后再使用完整任务"
+        type: boolean
+        default: false
+        required: false
   schedule:
     - cron: "0 1 * * *" # 每天北京时间 09:00；GitHub 可能延迟启动
 
@@ -40,6 +45,7 @@ jobs:
       IM_MAX_STEPS: ${{ vars.IM_MAX_STEPS || '200' }}
       TASK_RETRY_TIMES: ${{ vars.TASK_RETRY_TIMES || '3' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'Info' }}
+      TEST_MAX_SENDS: ${{ inputs.test_once && '1' || '0' }}
       # 版本与校验值必须与 Dockerfile 同步。
       CLOAK_CHROMIUM_VERSION: "146.0.7680.177.5"
       CLOAK_BINARY_SHA256: "4a12bcde95fa1bb1beef2b41ab5e5c27c36be78e3be3d0dac8c64d705216670e"
@@ -66,6 +72,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+
+      - name: Run regression tests
+        run: python -m unittest tests.test_douyin_im tests.test_logger tests.test_matching_guard tests.test_delivery_guards tests.test_task_results
 
       - name: Install Chromium system dependencies
         run: python -m playwright install-deps chromium
@@ -136,6 +145,11 @@ jobs:
               browser.close()
           print("应用 CloakBrowser 启动检查通过；未登录抖音或发送消息。")
           PY
+
+      - name: Check browser input without sending
+        env:
+          RUN_BROWSER_INPUT_TESTS: "1"
+        run: python -m unittest tests.test_browser_input
 
       - name: Run DouYin Spark Flow
         if: github.event_name == 'schedule' || !inputs.validate_only
