@@ -6,6 +6,7 @@ from core.browser import get_browser
 from playwright.sync_api import Response
 import time
 import json
+import os
 
 
 complates = {}
@@ -214,6 +215,33 @@ def scroll_and_select_user(page, username, targets):
                 break
 
 
+def describe_composer(page, container):
+    """Collect control structure only, without messages, names, or credentials."""
+    summary = container.evaluate("""root => {
+        const visible = element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+        const describe = element => ({
+            tag: element.tagName,
+            class: typeof element.className === 'string' ? element.className : '',
+            role: element.getAttribute('role'),
+            contenteditable: element.getAttribute('contenteditable'),
+            isContentEditable: element.isContentEditable,
+            tabIndex: element.tabIndex,
+            disabled: !!element.disabled,
+            visible: visible(element),
+            draftPresent: !!((element.value || (element.isContentEditable ? element.innerText : '') || '').trim())
+        });
+        let scope = root;
+        for (let i = 0; i < 2 && scope.parentElement; i++) scope = scope.parentElement;
+        return {
+            container: describe(root),
+            editors: [...root.querySelectorAll('textarea,input,[contenteditable="true"],[role="textbox"]')].map(describe),
+            sendControls: [...scope.querySelectorAll('button,[role="button"],[class*="send"],input[type="submit"]')]
+                .filter(visible).map(describe).slice(0, 20)
+        };
+    }""")
+    logger.info("COMPOSER_DIAGNOSTIC %s", json.dumps(summary, ensure_ascii=True))
+
+
 def do_user_task(browser, username, cookies, targets):
         context = browser.new_context()  # 每个任务使用独立的上下文
         context.set_default_navigation_timeout(config["browserTimeout"])  # 设置导航超时时间为 120 秒
@@ -252,6 +280,11 @@ def do_user_task(browser, username, cookies, targets):
             chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
             page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
             chat_input = page.locator(chat_input_selector)
+
+            if os.getenv("DIAGNOSE_ONLY", "false").lower() == "true":
+                describe_composer(page, chat_input)
+                logger.info("只读聊天控件诊断完成：未输入或发送消息。")
+                break
 
             # 在 chat-input-dccKiL 中输入内容
             message = build_message()

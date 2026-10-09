@@ -8,6 +8,11 @@ on:
         type: boolean
         default: true
         required: true
+      diagnose_only:
+        description: "只检查抖音聊天输入框，不输入或发送消息"
+        type: boolean
+        default: false
+        required: true
   schedule:
     - cron: "0 1 * * *" # 每天北京时间 09:00；GitHub 可能延迟启动
 
@@ -37,6 +42,7 @@ jobs:
       TASK_RETRY_TIMES: ${{ vars.TASK_RETRY_TIMES || '3' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'Info' }}
       PYTHONUNBUFFERED: "1"
+      DIAGNOSE_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -75,7 +81,7 @@ jobs:
           PY
 
       - name: Run DouYin Spark Flow
-        if: github.event_name == 'schedule' || !inputs.validate_only
+        if: github.event_name == 'schedule' || !inputs.validate_only || inputs.diagnose_only
         run: python main.py
 
       - name: Upload run logs
