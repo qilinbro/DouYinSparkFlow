@@ -134,6 +134,35 @@ class CloudLoginTests(unittest.TestCase):
             self.assertFalse(self.login._refresh_expired_qr(self.page))
         self.page.get_by_text.return_value.nth.return_value.click.assert_not_called()
 
+    def test_expired_qr_refresh_clicks_are_spaced_and_snapshot_waits_for_render(self):
+        for finish_at, expected_clicks in ((15, [0]), (25, [0, 20])):
+            with self.subTest(finish_at=finish_at):
+                clock = {"now": 0}
+                click_times = []
+                capture_times = []
+                self.page.wait_for_timeout.side_effect = lambda _ms: clock.update(now=clock["now"] + 1)
+                self.page.evaluate.side_effect = lambda expression: (
+                    {"hasChatRoot": clock["now"] >= finish_at,
+                     "loginVisible": clock["now"] < finish_at}
+                    if expression == self.login.JS_LOGIN_DOM
+                    else {"ready": clock["now"] >= finish_at})
+                def click_refresh(_page):
+                    click_times.append(clock["now"])
+                    return True
+                def capture_qr(_page):
+                    capture_times.append(clock["now"])
+                    return b"PRIVATE-QR-PIXELS"
+                with patch.object(self.login.time, "monotonic", side_effect=lambda: clock["now"]), \
+                     patch.object(self.login, "_refresh_expired_qr", side_effect=click_refresh), \
+                     patch.object(self.login, "_qr_image_bytes", side_effect=capture_qr):
+                    self.login._wait_for_login(self.page, self.settings | {"timeout": 30})
+                self.assertEqual(click_times, expected_clicks)
+                self.assertEqual(capture_times[0], 2)
+                self.assertTrue(all(time - clicked >= 2 for time in capture_times for clicked in click_times
+                                    if clicked <= time))
+                self.assertNotIn("qr_refreshed", self.output.getvalue())
+                self.assertIn("qr_refresh_clicked", self.output.getvalue())
+
     def test_plain_conversation_page_is_never_used_as_qr_screenshot(self):
         with patch.object(self.login, "_any_visible", return_value=False):
             self.assertIsNone(self.login._qr_image_bytes(self.page))

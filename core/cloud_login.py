@@ -164,6 +164,7 @@ def _refresh_expired_qr(page):
 def _wait_for_login(page, settings):
     deadline = time.monotonic() + settings["timeout"]
     next_snapshot = 0.0
+    next_refresh = 0.0
     next_observation = 0.0
     next_error = 0.0
     snapshots = 0
@@ -177,11 +178,14 @@ def _wait_for_login(page, settings):
                     and not login.get("loginVisible")):
                 _phase("chat_loaded")
                 return
-            refreshed = _refresh_expired_qr(page)
-            if refreshed:
-                next_snapshot = 0.0
-                _phase("qr_refreshed")
             now = time.monotonic()
+            refreshed = now >= next_refresh and _refresh_expired_qr(page)
+            if refreshed:
+                next_refresh = now + 20.0
+                # A click is not proof of a new QR. Give the normal page time
+                # to render before capturing its updated encrypted view.
+                next_snapshot = now + 2.0
+                _phase("qr_refresh_clicked")
             if now >= next_snapshot:
                 next_snapshot = now + 10.0
                 image = _qr_image_bytes(page)
