@@ -95,7 +95,7 @@ UNCONFIRMED = {"ok": False, "via": "dom", "reason": "receipt-unconfirmed", "dom_
 class TaskResultTests(unittest.TestCase):
     def setUp(self):
         self.tasks = _load_tasks()
-        self.env = patch.dict(os.environ, {"TEST_MAX_SENDS": "0"})
+        self.env = patch.dict(os.environ, {"TEST_MAX_SENDS": "0", "CLOUD_AUTH_DIR": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -223,7 +223,7 @@ class RunTaskExitTests(unittest.TestCase):
         ]
         self.tasks.get_browser = MagicMock()
         self.tasks._notify_summary = MagicMock()
-        self.env = patch.dict(os.environ, {"TEST_MAX_SENDS": "0"})
+        self.env = patch.dict(os.environ, {"TEST_MAX_SENDS": "0", "CLOUD_AUTH_DIR": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -254,6 +254,17 @@ class RunTaskExitTests(unittest.TestCase):
         self.tasks.userData = []
         self.assertEqual(self.tasks.runTasks(), 1)
         self.tasks.get_browser.assert_not_called()
+
+    def test_invalid_cloud_state_stops_before_browser_without_cookie_fallback(self):
+        from utils.cloud_auth import CloudAuthError
+        for user in self.tasks.userData:
+            user['unique_id'] = 'synthetic_account'
+        self.tasks.do_user_task = MagicMock()
+        with patch.dict(os.environ, {'CLOUD_AUTH_DIR': 'synthetic'}), \
+             patch('utils.cloud_auth.load_bundle', side_effect=CloudAuthError('Missing state.')):
+            self.assertEqual(self.tasks.runTasks(), 1)
+        self.tasks.get_browser.assert_not_called()
+        self.tasks.do_user_task.assert_not_called()
 
     def test_invalid_send_limit_fails_before_browser(self):
         for value in ("-1", "invalid", "1.5"):

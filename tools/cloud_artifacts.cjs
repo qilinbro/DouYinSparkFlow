@@ -7,7 +7,8 @@ const {constants} = require('node:fs');
 const path = require('node:path');
 
 const POLL_MS = 8000;
-const DEADLINE_MS = 10 * 60 * 1000 + 30000;
+// Allow the 10-minute authorization window plus navigation and one task.
+const DEADLINE_MS = 20 * 60 * 1000 + 30000;
 const MAX_QR_BYTES = 4 * 1024 * 1024;
 
 function inside(parent, candidate) {
