@@ -1,6 +1,7 @@
 """Restore only encrypted auth files from the latest cloud run artifact."""
 
 import io
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,15 @@ import requests
 from utils.cloud_auth import CloudAuthError, load_bundle
 
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+
+
+def latest_auth_artifact(artifacts):
+    candidates = [artifact for artifact in artifacts
+                  if re.fullmatch(r"cloud-auth-state-[0-9]+", artifact["name"]) and not artifact["expired"]]
+    if not candidates:
+        raise CloudAuthError("No encrypted cloud login exists; run cloud QR login first.")
+    # Artifact IDs may come from different shards; they are not a time order.
+    return max(candidates, key=lambda artifact: datetime.fromisoformat(artifact["created_at"].replace("Z", "+00:00")))
 
 
 def restore_archive(content, account_ids, directory):
@@ -57,11 +67,7 @@ def main():
                             "X-GitHub-Api-Version": "2022-11-28"})
     response = session.get(f"{base_url}/actions/artifacts", params={"per_page": 100}, timeout=45)
     response.raise_for_status()
-    candidates = [artifact for artifact in response.json()["artifacts"]
-                  if artifact["name"].startswith("cloud-auth-state-") and not artifact["expired"]]
-    if not candidates:
-        raise CloudAuthError("No encrypted cloud login exists; run cloud QR login first.")
-    latest = max(candidates, key=lambda artifact: artifact["id"])
+    latest = latest_auth_artifact(response.json()["artifacts"])
     response = session.get(f"{base_url}/actions/artifacts/{int(latest['id'])}/zip", timeout=60)
     response.raise_for_status()
     restore_archive(response.content, account_ids, directory)

@@ -4,7 +4,9 @@ QR images are encrypted in memory before they reach the artifact directory.
 The account task owns neither this context nor its page: the same live tab is
 retained throughout QR authorization, identity verification and the one send.
 """
+import base64
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,12 +35,14 @@ class CloudLoginTimeout(CloudLoginError):
 
 _QR_CANDIDATE = """images => images.findIndex(img => {
   const style = getComputedStyle(img);
+  const rect = img.getBoundingClientRect();
   return img.complete && img.naturalWidth >= 100
     && img.clientWidth >= 100 && img.clientWidth <= 260
     && img.clientHeight >= 100 && img.clientHeight <= 260
     && Math.abs(img.clientWidth - img.clientHeight) <= 8
     && img.getClientRects().length && style.display !== 'none'
-    && style.visibility !== 'hidden';
+    && style.visibility !== 'hidden' && rect.x >= 0 && rect.y >= 0
+    && rect.right <= innerWidth + 1 && rect.bottom <= innerHeight + 1;
 })"""
 _QR_EXPIRED = re.compile(r"二维码.{0,6}(?:失效|过期)|(?:失效|过期).{0,6}二维码")
 _QR_CONFIRM = re.compile(r"扫码成功|手机.{0,8}确认|等待.{0,6}确认")
@@ -91,6 +95,33 @@ def _settings():
     }
 
 
+def _capture_view_bytes(page, box=None):
+    """Read rendered Chromium pixels without waiting for web fonts to load."""
+    options = {"format": "png", "fromSurface": True, "captureBeyondViewport": False}
+    if box is not None:
+        if (not isinstance(box, dict)
+                or any(not isinstance(box.get(key), (int, float))
+                       or isinstance(box.get(key), bool) or not math.isfinite(box[key])
+                       for key in ("x", "y", "width", "height"))
+                or box["x"] < 0 or box["y"] < 0
+                or box["width"] <= 0 or box["height"] <= 0):
+            raise CloudLoginError()
+        options["clip"] = {key: box[key] for key in ("x", "y", "width", "height")}
+        options["clip"]["scale"] = 1
+    session = page.context.new_cdp_session(page)
+    try:
+        encoded = session.send("Page.captureScreenshot", options).get("data")
+        if not isinstance(encoded, str) or not encoded:
+            raise CloudLoginError()
+        return base64.b64decode(encoded, validate=True)
+    finally:
+        # Only detach this read-only inspector, never the browser/session.
+        try:
+            session.detach()
+        except Exception:
+            pass
+
+
 def _qr_image_bytes(page):
     """Capture the rendered login QR, never the user's conversation page."""
     login_label = page.get_by_text("扫码登录", exact=True)
@@ -102,7 +133,9 @@ def _qr_image_bytes(page):
         images = page.locator(selector)
         candidate = images.evaluate_all(_QR_CANDIDATE)
         if isinstance(candidate, int) and candidate >= 0:
-            return images.nth(candidate).screenshot(timeout=3000)
+            box = images.nth(candidate).bounding_box(timeout=3000)
+            if box is not None:
+                return _capture_view_bytes(page, box)
     return None
 
 
@@ -131,6 +164,8 @@ def _refresh_expired_qr(page):
 def _wait_for_login(page, settings):
     deadline = time.monotonic() + settings["timeout"]
     next_snapshot = 0.0
+    next_observation = 0.0
+    next_error = 0.0
     snapshots = 0
     while time.monotonic() < deadline:
         if page.is_closed():
@@ -148,23 +183,33 @@ def _wait_for_login(page, settings):
                 _phase("qr_refreshed")
             now = time.monotonic()
             if now >= next_snapshot:
+                next_snapshot = now + 10.0
                 image = _qr_image_bytes(page)
-                if image is None and not login.get("hasChatRoot"):
+                if image is None and now >= next_observation:
+                    _phase("login_view_pending", has_chat_root=bool(login.get("hasChatRoot")),
+                           avatar_card=bool(login.get("avatarCard")),
+                           list_ready=bool(ready.get("ready")),
+                           login_visible=bool(login.get("loginVisible")))
+                    next_observation = now + 30.0
+                if image is None and not login.get("avatarCard"):
                     # A fresh guest page can render a canvas QR or a normal
-                    # verification page. Show it only through encrypted view.
-                    image = page.screenshot(full_page=False, timeout=3000)
+                    # verification page, including a mounted guest chat shell.
+                    # Show it only through encrypted view, before an avatar.
+                    image = _capture_view_bytes(page)
                 if image:
                     encrypted = seal_bytes(image, settings["view_key"], purpose="login-view")
                     atomic_write_encrypted(settings["qr_path"], encrypted)
                     snapshots += 1
                     _phase("awaiting_qr_login", snapshot=snapshots)
-                next_snapshot = now + 10.0
         except (CloudLoginError, CloudAuthError, OSError):
             raise
-        except Exception:
+        except Exception as exc:
             # A QR login navigation can replace the JS execution context.
             # Retry observation only. Never retry a message send here.
-            pass
+            now = time.monotonic()
+            if now >= next_error:
+                _phase("login_observation_error", error_class=type(exc).__name__)
+                next_error = now + 30.0
         page.wait_for_timeout(1000)
     raise CloudLoginTimeout()
 
@@ -194,8 +239,10 @@ def run_cloud_login():
         page = context.new_page()
         # Start fresh. No add_cookies or imported storage is used at bootstrap.
         page.goto("https://www.douyin.com/?recommend=1", wait_until="commit", timeout=30000)
+        _phase("login_home_navigation_complete")
         page.wait_for_timeout(1200)
         page.goto("https://www.douyin.com/chat", wait_until="commit", timeout=30000)
+        _phase("login_chat_navigation_complete")
         _wait_for_login(page, settings)
         # The task verifies READY + the expected account before this callback,
         # selecting a friend, or sending. It retains this exact live page.

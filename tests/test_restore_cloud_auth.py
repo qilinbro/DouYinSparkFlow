@@ -6,7 +6,7 @@ from unittest.mock import patch
 import zipfile
 
 from utils.cloud_auth import CloudAuthError
-from utils.restore_cloud_auth import restore_archive
+from utils.restore_cloud_auth import restore_archive, latest_auth_artifact
 
 
 def make_archive(files):
@@ -18,6 +18,14 @@ def make_archive(files):
 
 
 class RestoreArchiveTests(unittest.TestCase):
+    def test_latest_state_uses_creation_time_instead_of_artifact_id(self):
+        old = {'id': 999, 'name': 'cloud-auth-state-1', 'expired': False, 'created_at': '2026-10-09T12:00:00Z'}
+        new = {'id': 123, 'name': 'cloud-auth-state-2', 'expired': False, 'created_at': '2026-10-10T12:00:00Z'}
+        excluded = dict(new, id=8888, expired=True, created_at='2026-10-11T12:00:00Z')
+        self.assertEqual(latest_auth_artifact([new, old, excluded]), new)
+        with self.assertRaises(CloudAuthError):
+            latest_auth_artifact([excluded])
+
     def test_restores_only_expected_encrypted_files(self):
         with tempfile.TemporaryDirectory() as directory:
             restore_archive(make_archive([("account.bin", b"opaque encrypted bytes")]), ["account"], directory)

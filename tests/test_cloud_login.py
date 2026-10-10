@@ -1,4 +1,5 @@
 """Cloud authorization boundaries, without a browser, account or network."""
+import base64
 import importlib.util
 import io
 import json
@@ -47,6 +48,7 @@ class CloudLoginTests(unittest.TestCase):
         self.browser = self.login.get_browser.return_value
         self.context = self.browser.new_context.return_value
         self.page = self.context.new_page.return_value
+        self.page.context = self.context
         self.page.is_closed.return_value = False
         self.output = io.StringIO()
         self.stdout = patch("sys.stdout", self.output)
@@ -76,6 +78,8 @@ class CloudLoginTests(unittest.TestCase):
         self.assertEqual(kwargs["expected_uid"], "20000000002")
         self.assertEqual(args[2:4], ([], ["synthetic-target"]))
         self.assertEqual(self.login.save_bundle.call_count, 2)
+        self.assertIn("login_home_navigation_complete", self.output.getvalue())
+        self.assertIn("login_chat_navigation_complete", self.output.getvalue())
         self.context.close.assert_called_once()
         self.browser.close.assert_called_once()
 
@@ -135,6 +139,88 @@ class CloudLoginTests(unittest.TestCase):
             self.assertIsNone(self.login._qr_image_bytes(self.page))
         self.page.locator.assert_not_called()
         self.page.screenshot.assert_not_called()
+
+    def test_qr_capture_reads_only_rendered_image_clip_without_font_wait(self):
+        pixels = b"PRIVATE-QR-PIXELS"
+        session = self.context.new_cdp_session.return_value
+        session.send.return_value = {"data": base64.b64encode(pixels).decode("ascii")}
+        images = self.page.locator.return_value
+        images.evaluate_all.return_value = 0
+        box = {"x": 25.5, "y": 60, "width": 160, "height": 160}
+        images.nth.return_value.bounding_box.return_value = box
+        with patch.object(self.login, "_any_visible", return_value=True):
+            self.assertEqual(self.login._qr_image_bytes(self.page), pixels)
+        self.context.new_cdp_session.assert_called_once_with(self.page)
+        session.send.assert_called_once_with("Page.captureScreenshot", {
+            "format": "png", "fromSurface": True, "captureBeyondViewport": False,
+            "clip": {**box, "scale": 1},
+        })
+        session.detach.assert_called_once()
+        images.nth.return_value.screenshot.assert_not_called()
+        self.page.screenshot.assert_not_called()
+        self.assertNotIn("PRIVATE-QR-PIXELS", self.output.getvalue())
+
+    def test_viewport_capture_detaches_cdp_even_when_capture_fails(self):
+        session = self.context.new_cdp_session.return_value
+        session.send.side_effect = RuntimeError("PRIVATE-ERROR-VALUE")
+        with self.assertRaises(RuntimeError):
+            self.login._capture_view_bytes(self.page)
+        session.send.assert_called_once_with("Page.captureScreenshot", {
+            "format": "png", "fromSurface": True, "captureBeyondViewport": False,
+        })
+        session.detach.assert_called_once()
+        self.context.close.assert_not_called()
+        self.browser.close.assert_not_called()
+        self.assertNotIn("PRIVATE-ERROR-VALUE", self.output.getvalue())
+
+    def test_invalid_capture_clip_cannot_open_a_debug_session(self):
+        for box in ({"x": -1, "y": 0, "width": 100, "height": 100},
+                    {"x": 0, "y": 0, "width": float("nan"), "height": 100},
+                    {"x": 0, "y": 0, "width": 100, "height": 0}):
+            with self.subTest(box=box):
+                with self.assertRaises(self.login.CloudLoginError):
+                    self.login._capture_view_bytes(self.page, box)
+        self.context.new_cdp_session.assert_not_called()
+
+    def test_guest_chat_shell_does_not_suppress_encrypted_viewport_diagnostic(self):
+        self.page.evaluate.side_effect = [
+            {"hasChatRoot": True, "avatarCard": False, "loginVisible": True}, {"ready": False},
+            {"hasChatRoot": True, "avatarCard": True, "loginVisible": False}, {"ready": True},
+        ]
+        session = self.context.new_cdp_session.return_value
+        session.send.return_value = {"data": base64.b64encode(b"PRIVATE-GUEST-VIEW").decode("ascii")}
+        with patch.object(self.login, "_refresh_expired_qr", return_value=False), \
+             patch.object(self.login, "_qr_image_bytes", return_value=None):
+            self.login._wait_for_login(self.page, self.settings)
+        self.login.seal_bytes.assert_called_once_with(
+            b"PRIVATE-GUEST-VIEW", "synthetic-view-key", purpose="login-view")
+        self.login.atomic_write_encrypted.assert_called_once_with(
+            Path("synthetic/qr.bin"), b"synthetic-ciphertext")
+        self.assertIn('"has_chat_root": true', self.output.getvalue())
+        self.assertNotIn("PRIVATE-GUEST-VIEW", self.output.getvalue())
+        self.page.screenshot.assert_not_called()
+
+    def test_visible_account_avatar_suppresses_full_viewport_fallback(self):
+        self.page.evaluate.side_effect = [
+            {"hasChatRoot": True, "avatarCard": True, "loginVisible": False}, {"ready": False},
+            {"hasChatRoot": True, "avatarCard": True, "loginVisible": False}, {"ready": True},
+        ]
+        with patch.object(self.login, "_refresh_expired_qr", return_value=False), \
+             patch.object(self.login, "_qr_image_bytes", return_value=None):
+            self.login._wait_for_login(self.page, self.settings)
+        self.context.new_cdp_session.assert_not_called()
+        self.login.seal_bytes.assert_not_called()
+        self.login.atomic_write_encrypted.assert_not_called()
+
+    def test_observation_errors_report_only_class_and_are_rate_limited(self):
+        self.page.evaluate.side_effect = [ValueError("PRIVATE-ERROR-VALUE"),
+            ValueError("PRIVATE-ERROR-VALUE"),
+            {"hasChatRoot": True, "loginVisible": False}, {"ready": True}]
+        with patch.object(self.login.time, "monotonic", return_value=0):
+            self.login._wait_for_login(self.page, self.settings)
+        self.assertEqual(self.output.getvalue().count("login_observation_error"), 1)
+        self.assertIn('"error_class": "ValueError"', self.output.getvalue())
+        self.assertNotIn("PRIVATE-ERROR-VALUE", self.output.getvalue())
 
     def test_settings_require_expected_account_and_target_before_browser_start(self):
         env = {"TASKS": json.dumps([{"unique_id": "10000000001", "targets": ["synthetic-target"]}]),
