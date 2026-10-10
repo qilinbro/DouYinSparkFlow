@@ -5,6 +5,7 @@ The account task owns neither this context nor its page: the same live tab is
 retained throughout QR authorization, identity verification and the one send.
 """
 import base64
+import hashlib
 import json
 import math
 import os
@@ -141,21 +142,50 @@ def _qr_image_bytes(page):
 
 def _any_visible(locator):
     for index in range(min(locator.count(), 12)):
-        if locator.nth(index).is_visible():
+        candidate = locator.nth(index)
+        if candidate.is_visible() and candidate.evaluate("""element => {
+          for (let node = element; node instanceof Element; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden'
+                || style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+          }
+          return true;
+        }""") is True:
             return True
     return False
 
 
+def _qr_page_state(page):
+    # Confirmation wins even if the site retains an expired-label element.
+    if _any_visible(page.get_by_text(_QR_CONFIRM)):
+        return "confirming"
+    if _any_visible(page.get_by_text(_QR_EXPIRED)):
+        return "expired"
+    return None
+
+
+def _write_login_view(settings, state, image=None):
+    """Publish an authenticated status envelope, with pixels only when allowed."""
+    if state not in {"ready", "expired", "confirming", "pending", "diagnostic", "authenticated"}:
+        raise CloudLoginError()
+    if state not in {"ready", "diagnostic"}:
+        image = None
+    payload = json.dumps({
+        "version": 1, "state": state, "captured_at": time.time(),
+        "image": base64.b64encode(image).decode("ascii") if image else None,
+    }, separators=(",", ":")).encode("utf-8")
+    encrypted = seal_bytes(payload, settings["view_key"], purpose="login-view")
+    atomic_write_encrypted(settings["qr_path"], encrypted)
+
+
 def _refresh_expired_qr(page):
     """Use only the site's refresh control; preserve scans awaiting approval."""
-    if _any_visible(page.get_by_text(_QR_CONFIRM)):
-        return False
-    if not _any_visible(page.get_by_text(_QR_EXPIRED)):
+    if _qr_page_state(page) != "expired":
         return False
     controls = page.get_by_text(_QR_REFRESH, exact=True)
     for index in range(min(controls.count(), 12)):
         control = controls.nth(index)
-        if control.is_visible():
+        if _any_visible(control):
             control.click(timeout=3000)
             return True
     return False
@@ -165,9 +195,29 @@ def _wait_for_login(page, settings):
     deadline = time.monotonic() + settings["timeout"]
     next_snapshot = 0.0
     next_refresh = 0.0
-    next_observation = 0.0
+    next_publication = 0.0
     next_error = 0.0
     snapshots = 0
+    generation = 0
+    published_state = None
+    cached_state = "pending"
+    cached_image = None
+    last_ready_digest = None
+    diagnostic_digest = None
+    expired_digest = None
+    refresh_pending = False
+    diagnostic_shown = False
+
+    def publish(state, image=None, *, force=False):
+        nonlocal published_state, next_publication, snapshots
+        now = time.monotonic()
+        if force or state != published_state or now >= next_publication:
+            _write_login_view(settings, state, image)
+            snapshots += 1
+            published_state = state
+            next_publication = now + 10.0
+            _phase("awaiting_qr_login", state=state, generation=generation, snapshot=snapshots)
+
     while time.monotonic() < deadline:
         if page.is_closed():
             raise CloudLoginError()
@@ -176,41 +226,77 @@ def _wait_for_login(page, settings):
             ready = page.evaluate(JS_LIST_READY) or {}
             if (ready.get("ready") and login.get("hasChatRoot")
                     and not login.get("loginVisible")):
+                publish("authenticated")
                 _phase("chat_loaded")
                 return
             now = time.monotonic()
-            refreshed = now >= next_refresh and _refresh_expired_qr(page)
-            if refreshed:
-                next_refresh = now + 20.0
-                # A click is not proof of a new QR. Give the normal page time
-                # to render before capturing its updated encrypted view.
-                next_snapshot = now + 2.0
-                _phase("qr_refresh_clicked")
-            if now >= next_snapshot:
+            state = _qr_page_state(page)
+            if login.get("avatarCard"):
+                # A visible account can precede the complete conversation list.
+                # Do not capture any pixels once private content might be shown.
+                state = "pending"
+            if state in {"expired", "confirming", "pending"}:
+                cached_state, cached_image = "pending", None
+                # Clear the viewer before attempting a refresh or a screenshot.
+                publish(state)
+                if state == "expired":
+                    if not refresh_pending:
+                        refresh_pending = True
+                        expired_digest = last_ready_digest or diagnostic_digest
+                    if expired_digest is None:
+                        # If expiry is the first observation, remember its image
+                        # privately; it must never become a displayable QR.
+                        old_image = _qr_image_bytes(page)
+                        if old_image:
+                            expired_digest = hashlib.sha256(old_image).digest()
+                    if now >= next_refresh and _refresh_expired_qr(page):
+                        next_refresh = now + 20.0
+                        next_snapshot = now + 2.0
+                        _phase("qr_refresh_clicked")
+            elif now >= next_snapshot:
                 next_snapshot = now + 10.0
-                image = _qr_image_bytes(page)
-                if image is None and now >= next_observation:
-                    _phase("login_view_pending", has_chat_root=bool(login.get("hasChatRoot")),
-                           avatar_card=bool(login.get("avatarCard")),
-                           list_ready=bool(ready.get("ready")),
-                           login_visible=bool(login.get("loginVisible")))
-                    next_observation = now + 30.0
-                if image is None and not login.get("avatarCard"):
-                    # A fresh guest page can render a canvas QR or a normal
-                    # verification page, including a mounted guest chat shell.
-                    # Show it only through encrypted view, before an avatar.
-                    image = _capture_view_bytes(page)
-                if image:
-                    encrypted = seal_bytes(image, settings["view_key"], purpose="login-view")
-                    atomic_write_encrypted(settings["qr_path"], encrypted)
-                    snapshots += 1
-                    _phase("awaiting_qr_login", snapshot=snapshots)
+                if not diagnostic_shown and not refresh_pending:
+                    # One fresh guest view helps identify a QR or verification
+                    # panel. Its pixels use the same encrypted transport.
+                    diagnostic_shown = True
+                    cached_state, cached_image = "diagnostic", _capture_view_bytes(page)
+                    initial_qr = _qr_image_bytes(page)
+                    if initial_qr:
+                        diagnostic_digest = hashlib.sha256(initial_qr).digest()
+                    next_snapshot = now + 20.0
+                else:
+                    image = _qr_image_bytes(page)
+                    if image:
+                        digest = hashlib.sha256(image).digest()
+                        if refresh_pending and (expired_digest is None or digest == expired_digest):
+                            # The disappearance of the expiry label or a click
+                            # alone cannot make the same expired pixels usable.
+                            if expired_digest is None:
+                                expired_digest = digest
+                            cached_state, cached_image = "pending", None
+                        else:
+                            if digest != last_ready_digest:
+                                generation += 1
+                            last_ready_digest = digest
+                            diagnostic_shown = True
+                            refresh_pending = False
+                            expired_digest = None
+                            cached_state, cached_image = "ready", image
+                    elif refresh_pending:
+                        cached_state, cached_image = "pending", None
+                    else:
+                        cached_state, cached_image = "diagnostic", _capture_view_bytes(page)
+                publish(cached_state, cached_image, force=True)
+            else:
+                publish(cached_state, cached_image)
         except (CloudLoginError, CloudAuthError, OSError):
             raise
         except Exception as exc:
             # A QR login navigation can replace the JS execution context.
             # Retry observation only. Never retry a message send here.
             now = time.monotonic()
+            cached_state, cached_image = "pending", None
+            publish("pending")
             if now >= next_error:
                 _phase("login_observation_error", error_class=type(exc).__name__)
                 next_error = now + 30.0

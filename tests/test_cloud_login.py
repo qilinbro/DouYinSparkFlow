@@ -50,6 +50,9 @@ class CloudLoginTests(unittest.TestCase):
         self.page = self.context.new_page.return_value
         self.page.context = self.context
         self.page.is_closed.return_value = False
+        self.page.get_by_text.return_value.count.return_value = 0
+        self.context.new_cdp_session.return_value.send.return_value = {
+            "data": base64.b64encode(b"PRIVATE-GUEST-VIEW").decode("ascii")}
         self.output = io.StringIO()
         self.stdout = patch("sys.stdout", self.output)
         self.stdout.start()
@@ -65,6 +68,35 @@ class CloudLoginTests(unittest.TestCase):
              patch.object(self.login, "_wait_for_login"):
             code = self.login.run_cloud_login()
         return code
+
+    def _views(self):
+        return [json.loads(call.args[0]) for call in self.login.seal_bytes.call_args_list]
+
+    def _wait_sequence(self, frames):
+        """Observe synthetic page states once a second, then complete login."""
+        clock = {"now": 0}
+        clicks = []
+        def frame():
+            return frames[clock["now"]] if clock["now"] < len(frames) else {"authenticated": True}
+        def evaluate(expression):
+            value = frame()
+            if expression == self.login.JS_LIST_READY:
+                return {"ready": value.get("authenticated", False)}
+            return {"hasChatRoot": True, "avatarCard": value.get("avatar", False),
+                    "loginVisible": not value.get("authenticated", False)}
+        def refresh(_page):
+            clicks.append(clock["now"])
+            return True
+        self.page.evaluate.side_effect = evaluate
+        self.page.wait_for_timeout.side_effect = lambda _ms: clock.update(now=clock["now"] + 1)
+        with patch.object(self.login.time, "monotonic", side_effect=lambda: clock["now"]), \
+             patch.object(self.login.time, "time", side_effect=lambda: 1000 + clock["now"]), \
+             patch.object(self.login, "_qr_page_state", side_effect=lambda _page: frame().get("state")), \
+             patch.object(self.login, "_qr_image_bytes", side_effect=lambda _page: frame().get("image", b"PRIVATE-QR-PIXELS")), \
+             patch.object(self.login, "_capture_view_bytes", return_value=b"PRIVATE-GUEST-VIEW") as full_view, \
+             patch.object(self.login, "_refresh_expired_qr", side_effect=refresh):
+            self.login._wait_for_login(self.page, self.settings | {"timeout": len(frames) + 2})
+        return clicks, full_view
 
     def test_one_send_keeps_live_page_without_importing_old_cookie(self):
         code = self._run({"ok": True, "attempted": 1})
@@ -105,18 +137,21 @@ class CloudLoginTests(unittest.TestCase):
         self.browser.close.assert_called_once()
 
     def test_qr_pixels_are_encrypted_before_atomic_artifact_write(self):
-        self.page.evaluate.side_effect = [
-            {"loginVisible": True}, {"ready": False},
-            {"loginVisible": False, "hasChatRoot": True}, {"ready": True},
-        ]
-        with patch.object(self.login, "_refresh_expired_qr", return_value=False), \
-             patch.object(self.login, "_qr_image_bytes", return_value=b"PRIVATE-QR-PIXELS"):
-            self.login._wait_for_login(self.page, self.settings)
-        self.login.seal_bytes.assert_called_once_with(
-            b"PRIVATE-QR-PIXELS", "synthetic-view-key", purpose="login-view")
-        self.login.atomic_write_encrypted.assert_called_once_with(
-            Path("synthetic/qr.bin"), b"synthetic-ciphertext")
+        self._wait_sequence([{}] * 21)
+        views = self._views()
+        self.assertEqual([view["state"] for view in views],
+                         ["diagnostic", "diagnostic", "ready", "authenticated"])
+        self.assertEqual(base64.b64decode(views[2]["image"]), b"PRIVATE-QR-PIXELS")
+        for view, encrypted, written in zip(views, self.login.seal_bytes.call_args_list,
+                                           self.login.atomic_write_encrypted.call_args_list):
+            self.assertEqual(set(view), {"version", "state", "captured_at", "image"})
+            self.assertEqual(view["version"], 1)
+            self.assertEqual(encrypted.args[1], "synthetic-view-key")
+            self.assertEqual(encrypted.kwargs, {"purpose": "login-view"})
+            self.assertEqual(written.args, (Path("synthetic/qr.bin"), b"synthetic-ciphertext"))
+        self.assertIsNone(views[-1]["image"])
         self.assertNotIn("PRIVATE-QR-PIXELS", self.output.getvalue())
+        self.assertNotIn(base64.b64encode(b"PRIVATE-QR-PIXELS").decode(), self.output.getvalue())
         self.assertNotIn("synthetic-view-key", self.output.getvalue())
 
     def test_invalid_encryption_key_stops_immediately_before_send(self):
@@ -134,34 +169,71 @@ class CloudLoginTests(unittest.TestCase):
             self.assertFalse(self.login._refresh_expired_qr(self.page))
         self.page.get_by_text.return_value.nth.return_value.click.assert_not_called()
 
-    def test_expired_qr_refresh_clicks_are_spaced_and_snapshot_waits_for_render(self):
+    def test_expired_qr_refresh_clicks_are_spaced_and_expiry_has_no_pixels(self):
         for finish_at, expected_clicks in ((15, [0]), (25, [0, 20])):
             with self.subTest(finish_at=finish_at):
-                clock = {"now": 0}
-                click_times = []
-                capture_times = []
-                self.page.wait_for_timeout.side_effect = lambda _ms: clock.update(now=clock["now"] + 1)
-                self.page.evaluate.side_effect = lambda expression: (
-                    {"hasChatRoot": clock["now"] >= finish_at,
-                     "loginVisible": clock["now"] < finish_at}
-                    if expression == self.login.JS_LOGIN_DOM
-                    else {"ready": clock["now"] >= finish_at})
-                def click_refresh(_page):
-                    click_times.append(clock["now"])
-                    return True
-                def capture_qr(_page):
-                    capture_times.append(clock["now"])
-                    return b"PRIVATE-QR-PIXELS"
-                with patch.object(self.login.time, "monotonic", side_effect=lambda: clock["now"]), \
-                     patch.object(self.login, "_refresh_expired_qr", side_effect=click_refresh), \
-                     patch.object(self.login, "_qr_image_bytes", side_effect=capture_qr):
-                    self.login._wait_for_login(self.page, self.settings | {"timeout": 30})
+                self.login.seal_bytes.reset_mock()
+                click_times, full_view = self._wait_sequence([{"state": "expired"}] * finish_at)
                 self.assertEqual(click_times, expected_clicks)
-                self.assertEqual(capture_times[0], 2)
-                self.assertTrue(all(time - clicked >= 2 for time in capture_times for clicked in click_times
-                                    if clicked <= time))
+                self.assertTrue(all(view["image"] is None for view in self._views()))
+                self.assertTrue(all(view["state"] == "expired" for view in self._views()[:-1]))
+                full_view.assert_not_called()
                 self.assertNotIn("qr_refreshed", self.output.getvalue())
                 self.assertIn("qr_refresh_clicked", self.output.getvalue())
+
+    def test_expiry_and_confirmation_hide_pixels_immediately_during_diagnostic_window(self):
+        clicks, _ = self._wait_sequence([{}, {"state": "expired"}, {"state": "confirming"}])
+        self.assertEqual(clicks, [1])
+        views = self._views()
+        self.assertEqual([view["state"] for view in views],
+                         ["diagnostic", "expired", "confirming", "authenticated"])
+        self.assertEqual([view["captured_at"] for view in views], [1000, 1001, 1002, 1003])
+        self.assertTrue(all(view["image"] is None for view in views[1:]))
+
+    def test_confirmation_never_refreshes_or_captures_even_before_first_qr(self):
+        clicks, full_view = self._wait_sequence([{"state": "confirming"}] * 25)
+        self.assertEqual(clicks, [])
+        full_view.assert_not_called()
+        self.assertTrue(all(view["image"] is None for view in self._views()))
+        self.assertEqual([view["state"] for view in self._views()[:-1]], ["confirming"] * 3)
+
+    def test_refresh_click_and_removed_expiry_do_not_republish_unchanged_qr(self):
+        frames = [{}] * 21 + [{"state": "expired"}] + [{}] * 11 + [{"image": b"NEW-QR-PIXELS"}]
+        clicks, _ = self._wait_sequence(frames)
+        self.assertEqual(clicks, [21])
+        views = self._views()
+        ready = [view for view in views if view["state"] == "ready"]
+        self.assertEqual([view["captured_at"] for view in ready], [1020, 1033])
+        self.assertEqual(base64.b64decode(ready[-1]["image"]), b"NEW-QR-PIXELS")
+        between = [view for view in views if 1021 <= view["captured_at"] < 1033]
+        self.assertTrue(between)
+        self.assertTrue(all(view["image"] is None for view in between))
+        self.assertTrue(all(view["state"] in {"expired", "pending"} for view in between))
+
+    def test_initially_expired_qr_is_only_a_private_baseline_until_pixels_change(self):
+        clicks, full_view = self._wait_sequence(
+            [{"state": "expired"}] + [{}] * 11 + [{"image": b"NEW-QR-PIXELS"}])
+        self.assertEqual(clicks, [0])
+        full_view.assert_not_called()
+        ready = [view for view in self._views() if view["state"] == "ready"]
+        self.assertEqual([view["captured_at"] for view in ready], [1012])
+        self.assertTrue(all(view["image"] is None for view in self._views() if view["captured_at"] < 1012))
+
+    def test_opaque_status_envelopes_discard_accidentally_supplied_private_pixels(self):
+        for state in ("expired", "confirming", "pending", "authenticated"):
+            self.login._write_login_view(self.settings, state, b"PRIVATE-CONVERSATION")
+        self.assertTrue(all(view["image"] is None for view in self._views()))
+        self.assertNotIn("PRIVATE-CONVERSATION", self.output.getvalue())
+
+    def test_transparent_candidate_does_not_count_as_visible(self):
+        locator = MagicMock()
+        locator.count.return_value = 1
+        locator.nth.return_value.is_visible.return_value = True
+        locator.nth.return_value.evaluate.return_value = False
+        self.assertFalse(self.login._any_visible(locator))
+        self.assertIn("parentElement", locator.nth.return_value.evaluate.call_args.args[0])
+        locator.nth.return_value.evaluate.return_value = True
+        self.assertTrue(self.login._any_visible(locator))
 
     def test_plain_conversation_page_is_never_used_as_qr_screenshot(self):
         with patch.object(self.login, "_any_visible", return_value=False):
@@ -221,11 +293,10 @@ class CloudLoginTests(unittest.TestCase):
         with patch.object(self.login, "_refresh_expired_qr", return_value=False), \
              patch.object(self.login, "_qr_image_bytes", return_value=None):
             self.login._wait_for_login(self.page, self.settings)
-        self.login.seal_bytes.assert_called_once_with(
-            b"PRIVATE-GUEST-VIEW", "synthetic-view-key", purpose="login-view")
-        self.login.atomic_write_encrypted.assert_called_once_with(
-            Path("synthetic/qr.bin"), b"synthetic-ciphertext")
-        self.assertIn('"has_chat_root": true', self.output.getvalue())
+        views = self._views()
+        self.assertEqual([view["state"] for view in views], ["diagnostic", "authenticated"])
+        self.assertEqual(base64.b64decode(views[0]["image"]), b"PRIVATE-GUEST-VIEW")
+        self.assertIsNone(views[1]["image"])
         self.assertNotIn("PRIVATE-GUEST-VIEW", self.output.getvalue())
         self.page.screenshot.assert_not_called()
 
@@ -238,8 +309,8 @@ class CloudLoginTests(unittest.TestCase):
              patch.object(self.login, "_qr_image_bytes", return_value=None):
             self.login._wait_for_login(self.page, self.settings)
         self.context.new_cdp_session.assert_not_called()
-        self.login.seal_bytes.assert_not_called()
-        self.login.atomic_write_encrypted.assert_not_called()
+        self.assertEqual([view["state"] for view in self._views()], ["pending", "authenticated"])
+        self.assertTrue(all(view["image"] is None for view in self._views()))
 
     def test_observation_errors_report_only_class_and_are_rate_limited(self):
         self.page.evaluate.side_effect = [ValueError("PRIVATE-ERROR-VALUE"),
